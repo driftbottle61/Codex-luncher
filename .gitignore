@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+api-key
+provider.conf
+model-catalog.json
+.env

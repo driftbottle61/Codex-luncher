@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="${CODEX_PROVIDER_ROOT:-/root/.codex-providers}"
+CODEX="$(command -v codex)"
+die() { printf 'codex-provider: %s\n' "$*" >&2; exit 1; }
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+provider_dir() { printf '%s/%s' "$ROOT" "$1"; }
+
+setup_provider() {
+    local name label base model wire keyvar key catalog dir
+    read -r -p 'Provider name: ' name
+    valid_name "$name" || die 'invalid provider name'
+    dir="$(provider_dir "$name")"
+    read -r -p "Display name [$name]: " label; label="${label:-$name}"
+    read -r -p 'API base URL: ' base
+    [[ "$base" =~ ^https?:// ]] || die 'API base URL must start with http:// or https://'
+    read -r -p 'Model: ' model; [ -n "$model" ] || die 'model is required'
+    read -r -p 'Wire API [responses]: ' wire; wire="${wire:-responses}"
+    read -r -p 'Model catalog JSON path or URL (optional): ' catalog
+    read -r -p 'API key environment variable [OPENAI_API_KEY]: ' keyvar; keyvar="${keyvar:-OPENAI_API_KEY}"
+    [[ "$keyvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die 'invalid environment variable name'
+    read -r -s -p 'API key (hidden input): ' key; printf '\n'
+    [ -n "$key" ] || die 'API key is required'
+    mkdir -p "$dir/sessions"; chmod 700 "$ROOT" "$dir" "$dir/sessions"
+    cat > "$dir/provider.conf" <<EOF
+name=$name
+label=$label
+base_url=$base
+model=$model
+wire_api=$wire
+key_env=$keyvar
+EOF
+    chmod 600 "$dir/provider.conf"
+    printf '%s\n' "$key" > "$dir/api-key"
+    chmod 600 "$dir/api-key"
+    if [ -n "$catalog" ]; then
+        case "$catalog" in
+            https://*|http://*) command -v curl >/dev/null 2>&1 || die 'curl is required for catalog URL'; curl -fsSL --max-time 30 "$catalog" -o "$dir/model-catalog.json" ;;
+            *) [ -f "$catalog" ] || die "catalog file not found: $catalog"; cp "$catalog" "$dir/model-catalog.json" ;;
+        esac
+        chmod 600 "$dir/model-catalog.json"
+    fi
+    printf 'Configured %s. Export %s before use.\n' "$name" "$keyvar"
+}
+
+list_providers() {
+    [ -d "$ROOT" ] || { echo 'No providers configured.'; return; }
+    for dir in "$ROOT"/*; do
+        [ -f "$dir/provider.conf" ] || continue
+        unset name label base_url model wire_api key_env
+        . "$dir/provider.conf"
+        printf '%-18s model=%-28s key=%s sessions=%s\n' "$name" "$model" "$key_env" "$dir/sessions"
+    done
+}
+
+choose_provider() {
+    local dir choice name
+    local -a dirs=()
+    [ -d "$ROOT" ] || die 'no providers configured; run: codex-provider setup'
+    for dir in "$ROOT"/*; do
+        [ -f "$dir/provider.conf" ] || continue
+        dirs+=("$dir")
+    done
+    [ "${#dirs[@]}" -gt 0 ] || die 'no providers configured; run: codex-provider setup'
+    PS3='Select provider (q to quit): '
+    select dir in "${dirs[@]##*/}"; do
+        if [ -n "${dir:-}" ]; then
+            choose_model "$(provider_dir "$dir")"
+            printf '1) resume latest session\n2) start a new session\n'
+            read -r -p 'Select session action [1]: ' action
+            case "${action:-1}" in
+                2) SESSION_SUFFIX="new-$(date +%Y%m%d-%H%M%S)" MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$dir" ;;
+                1) MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$dir" resume --last ;;
+                *) echo 'Invalid selection.' ;;
+            esac
+        elif [ "$REPLY" = q ]; then
+            exit 0
+        else
+            echo 'Invalid selection.'
+        fi
+    done
+}
+
+choose_model() {
+    local dir="$1" model choice
+    local -a models=()
+    if [ -f "$dir/model-catalog.json" ] && command -v python3 >/dev/null 2>&1; then
+        mapfile -t models < <(python3 - "$dir/model-catalog.json" <<'PY'
+import json, sys
+try:
+    data=json.load(open(sys.argv[1]))
+    for item in data.get("models", []):
+        value=item.get("slug") or item.get("id")
+        if value: print(value)
+except Exception:
+    pass
+PY
+)
+    fi
+    if [ "${#models[@]}" -eq 0 ]; then
+        unset name label base_url model wire_api key_env
+        . "$dir/provider.conf"
+        models=("$model")
+    fi
+    PS3='Select model (q to quit): '
+    select choice in "${models[@]}"; do
+        if [ -n "${choice:-}" ]; then
+            SELECTED_MODEL="$choice"
+            return 0
+        elif [ "$REPLY" = q ]; then
+            exit 0
+        else
+            echo 'Invalid selection.'
+        fi
+    done
+}
+
+run_provider() {
+    local name="$1"; shift
+    local dir="$(provider_dir "$name")"
+    [ -f "$dir/provider.conf" ] || die "unknown provider: $name"
+    unset name label base_url model wire_api key_env
+    . "$dir/provider.conf"
+    model="${MODEL_OVERRIDE:-$model}"
+    if [ -z "${!key_env:-}" ] && [ -f "$dir/api-key" ]; then
+        export "$key_env=$(<"$dir/api-key")"
+    fi
+    [ -n "${!key_env:-}" ] || die "environment variable $key_env is not set and no saved key exists"
+    if [ "${1:-}" = resume ] && [ -z "${SESSION_SUFFIX:-}" ]; then
+        local latest_suffix
+        latest_suffix="$(find "$dir/sessions/$model" -mindepth 1 -maxdepth 1 -type d -name 'new-*' -printf '%T@ %f\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+        [ -n "$latest_suffix" ] && SESSION_SUFFIX="$latest_suffix"
+    fi
+    local session_dir="$dir/sessions/$model${SESSION_SUFFIX:+/$SESSION_SUFFIX}"
+    mkdir -p "$session_dir"
+    chmod 700 "$session_dir"
+    export CODEX_HOME="$session_dir"
+    export CODEX_PROVIDER_API_KEY="${!key_env}"
+    cd "$session_dir"
+    cat > "$session_dir/config.toml" <<EOF
+model_provider = "$name"
+model = "$model"
+model_reasoning_effort = "low"
+
+[model_providers.$name]
+name = "$label"
+base_url = "$base_url"
+env_key = "CODEX_PROVIDER_API_KEY"
+wire_api = "$wire_api"
+$(if [ "$name" = "tokenhub" ]; then printf 'disable_response_storage = true\n'; fi)
+
+[projects."$session_dir"]
+trust_level = "trusted"
+EOF
+    chmod 600 "$session_dir/config.toml"
+    command -v tmux >/dev/null 2>&1 || exec "$CODEX" -s danger-full-access "$@"
+    local tmux_name="codex-${name}-${model}${SESSION_SUFFIX:+-$SESSION_SUFFIX}"
+    tmux_name="${tmux_name//[^A-Za-z0-9_.-]/-}"
+    if [ ! -t 0 ]; then
+        exec "$CODEX" -s danger-full-access "$@"
+    fi
+    if tmux has-session -t "$tmux_name" 2>/dev/null; then
+        exec tmux attach-session -t "$tmux_name"
+    fi
+    local cmdline
+    printf -v cmdline '%q ' "$CODEX" -s danger-full-access "$@"
+    tmux new-session -d -s "$tmux_name" -c "$session_dir" "$cmdline"
+    exec tmux attach-session -t "$tmux_name"
+}
+
+case "${1:-}" in
+    '') choose_provider ;;
+    setup) setup_provider ;;
+    list) list_providers ;;
+    menu) choose_provider ;;
+    use) [ $# -ge 2 ] || die 'usage: codex-provider use NAME [args...]'; name="$2"; shift 2; run_provider "$name" "$@" ;;
+    resume) [ $# -ge 2 ] || die 'usage: codex-provider resume NAME [--last|--all|SESSION_ID]'; name="$2"; shift 2; run_provider "$name" resume "$@" ;;
+    *) cat <<'EOF'
+Usage:
+  codex-provider                 # menu, then resume the selected provider
+  codex-provider menu            # same as above
+  codex-provider setup
+  codex-provider list
+  codex-provider use NAME [codex args...]
+  codex-provider resume NAME [--last|--all|SESSION_ID]
+EOF
+    exit 1 ;;
+esac
