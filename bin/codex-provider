@@ -90,6 +90,8 @@ choose_provider() {
     PS3='Select provider (q to quit): '
     select dir in "${dirs[@]##*/}"; do
         if [ -n "${dir:-}" ]; then
+            printf 'Updating %s model catalog...\n' "$dir"
+            update_provider_models "$dir" || printf 'codex-provider: using cached model catalog\n' >&2
             choose_model "$(provider_dir "$dir")"
             printf '1) resume latest session\n2) start a new session\n'
             read -r -p 'Select session action [1]: ' action
