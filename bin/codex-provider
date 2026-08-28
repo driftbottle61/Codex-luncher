@@ -192,7 +192,12 @@ EOF
     fi
     local cmdline
     printf -v cmdline '%q ' "$CODEX" -s danger-full-access "$@"
-    tmux new-session -d -s "$tmux_name" -c "$session_dir" "$cmdline"
+    tmux new-session -d -s "$tmux_name" -c "$session_dir" \
+        -e "CODEX_HOME=$session_dir" \
+        -e "CODEX_PROVIDER_API_KEY=${CODEX_PROVIDER_API_KEY}" \
+        -e "CODEX_PROVIDER_NAME=$name" \
+        -e "CODEX_PROVIDER_MODEL=$model" \
+        "$cmdline"
     exec tmux attach-session -t "$tmux_name"
 }
 
