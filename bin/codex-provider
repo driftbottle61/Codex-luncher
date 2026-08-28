@@ -7,6 +7,29 @@ die() { printf 'codex-provider: %s\n' "$*" >&2; exit 1; }
 valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 provider_dir() { printf '%s/%s' "$ROOT" "$1"; }
 
+update_provider_models() {
+    local pname="$1" dir keyvar tmp
+    dir="$(provider_dir "$pname")"
+    [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
+    unset name label base_url model wire_api key_env
+    . "$dir/provider.conf"
+    keyvar="$key_env"
+    if [ -z "${!keyvar:-}" ] && [ -f "$dir/api-key" ]; then export "$keyvar=$(<"$dir/api-key")"; fi
+    [ -n "${!keyvar:-}" ] || die "environment variable $keyvar is not set and no saved key exists"
+    command -v curl >/dev/null 2>&1 || die 'curl is required to update models'
+    command -v jq >/dev/null 2>&1 || die 'jq is required to update models'
+    tmp="$(mktemp)"
+    if ! curl -fsSL --max-time 30 -H "Authorization: Bearer ${!keyvar}" "$base_url/models" -o "$tmp"; then rm -f "$tmp"; return 1; fi
+    jq -e '{models: [(.data // .models // [])[] | (.id // .slug) as $id | select($id != null) | {slug:$id,id:$id,display_name:(.name // $id)}]}' "$tmp" > "$dir/model-catalog.json" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$dir/model-catalog.json"; rm -f "$tmp"; printf 'Updated model catalog: %s\n' "$dir/model-catalog.json"
+}
+
+auto_update_models() {
+    local dir
+    [ "${CODEX_PROVIDER_AUTO_UPDATE:-0}" = 1 ] || return 0
+    for dir in "$ROOT"/*; do [ -f "$dir/provider.conf" ] || continue; unset name; . "$dir/provider.conf"; update_provider_models "$name" || true; done
+}
+
 setup_provider() {
     local name label base model wire keyvar key catalog dir
     read -r -p 'Provider name: ' name
@@ -58,6 +81,7 @@ choose_provider() {
     local dir choice name
     local -a dirs=()
     [ -d "$ROOT" ] || die 'no providers configured; run: codex-provider setup'
+    auto_update_models
     for dir in "$ROOT"/*; do
         [ -f "$dir/provider.conf" ] || continue
         dirs+=("$dir")
@@ -174,6 +198,7 @@ case "${1:-}" in
     setup) setup_provider ;;
     list) list_providers ;;
     menu) choose_provider ;;
+    update) [ $# -ge 2 ] || die 'usage: codex-provider update NAME|all'; if [ "$2" = all ]; then for d in "$ROOT"/*; do [ -f "$d/provider.conf" ] || continue; unset name; . "$d/provider.conf"; update_provider_models "$name" || exit 1; done; else update_provider_models "$2"; fi ;;
     use) [ $# -ge 2 ] || die 'usage: codex-provider use NAME [args...]'; name="$2"; shift 2; run_provider "$name" "$@" ;;
     resume) [ $# -ge 2 ] || die 'usage: codex-provider resume NAME [--last|--all|SESSION_ID]'; name="$2"; shift 2; run_provider "$name" resume "$@" ;;
     *) cat <<'EOF'
@@ -181,6 +206,7 @@ Usage:
   codex-provider                 # menu, then resume the selected provider
   codex-provider menu            # same as above
   codex-provider setup
+  codex-provider update NAME|all
   codex-provider list
   codex-provider use NAME [codex args...]
   codex-provider resume NAME [--last|--all|SESSION_ID]
