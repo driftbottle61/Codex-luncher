@@ -182,7 +182,8 @@ EOF
     chmod 600 "$session_dir/config.toml"
     command -v tmux >/dev/null 2>&1 || exec "$CODEX" -s danger-full-access "$@"
     local tmux_name="codex-${name}-${model}${SESSION_SUFFIX:+-$SESSION_SUFFIX}"
-    tmux_name="${tmux_name//[^A-Za-z0-9_.-]/-}"
+    # Dots have special meaning in tmux targets (window.pane), so avoid them.
+    tmux_name="${tmux_name//[^A-Za-z0-9_-]/-}"
     if [ ! -t 0 ]; then
         exec "$CODEX" -s danger-full-access "$@"
     fi
