@@ -3,11 +3,17 @@ set -Eeuo pipefail
 
 PREFIX="${PREFIX:-/usr/local}"
 TARGET="$PREFIX/bin/codex-provider"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUDO=""
 RAW_BASE="${CODEX_PROVIDER_RAW_BASE:-https://raw.githubusercontent.com/driftbottle61/Codex-luncher/main}"
 
-SOURCE="$ROOT/bin/codex-provider"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [ -n "$SCRIPT_SOURCE" ] && [ -f "$SCRIPT_SOURCE" ]; then
+  ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SOURCE="$ROOT/bin/codex-provider"
+else
+  ROOT=""
+  SOURCE="$ROOT/bin/codex-provider"
+fi
 if [ ! -f "$SOURCE" ]; then
   command -v curl >/dev/null 2>&1 || {
     echo "curl is required when installing via curl | bash" >&2
@@ -15,7 +21,10 @@ if [ ! -f "$SOURCE" ]; then
   }
   SOURCE="$(mktemp)"
   trap 'rm -f "$SOURCE"' EXIT
-  curl -fsSL "$RAW_BASE/bin/codex-provider" -o "$SOURCE"
+  if ! curl -fsSL "$RAW_BASE/bin/codex-provider" -o "$SOURCE"; then
+    echo "failed to download $RAW_BASE/bin/codex-provider" >&2
+    exit 1
+  fi
 fi
 
 if ! command -v tmux >/dev/null 2>&1; then

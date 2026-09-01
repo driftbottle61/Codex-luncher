@@ -7,7 +7,16 @@ competing writers.
 
 ## Install
 
-Install Codex and tmux first, then run from this directory:
+Install Codex first (`npm install -g @openai/codex`). The installer also
+installs tmux automatically when it is missing.
+
+One-shot install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/driftbottle61/Codex-luncher/main/install.sh | sudo bash
+```
+
+Or clone this repository and run locally:
 
 ```bash
 sudo ./install.sh
