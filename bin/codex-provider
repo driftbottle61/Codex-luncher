@@ -30,6 +30,113 @@ auto_update_models() {
     for dir in "$ROOT"/*; do [ -f "$dir/provider.conf" ] || continue; unset name; . "$dir/provider.conf"; update_provider_models "$name" || true; done
 }
 
+ensure_base_instructions() {
+    local out="$ROOT/base-instructions.md" ver tag url
+    [ -s "$out" ] && { printf '%s' "$out"; return 0; }
+    ver="$(codex --version 2>/dev/null | sed -n 's/^codex-cli \([0-9][0-9.]*\).*/\1/p' | head -1 || true)"
+    tag="main"
+    [ -n "$ver" ] && tag="rust-v$ver"
+    command -v curl >/dev/null 2>&1 || { printf '%s' ''; return 0; }
+    url="https://raw.githubusercontent.com/openai/codex/$tag/codex-rs/models-manager/prompt.md"
+    if curl -fsSL --max-time 20 "$url" -o "$out.tmp" 2>/dev/null && [ -s "$out.tmp" ]; then
+        mv "$out.tmp" "$out"; chmod 644 "$out"; printf '%s' "$out"; return 0
+    fi
+    rm -f "$out.tmp"
+    if [ "$tag" != main ]; then
+        url="https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/prompt.md"
+        if curl -fsSL --max-time 20 "$url" -o "$out.tmp" 2>/dev/null && [ -s "$out.tmp" ]; then
+            mv "$out.tmp" "$out"; chmod 644 "$out"; printf '%s' "$out"; return 0
+        fi
+        rm -f "$out.tmp"
+    fi
+    printf '%s' ''
+}
+
+ensure_codex_catalog() {
+    local dir="$1" base
+    [ -f "$dir/model-catalog.json" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    base="$(ensure_base_instructions)"
+    python3 - "$dir" "${base:-}" <<'PY'
+import json, os, sys
+dirpath, base_path = sys.argv[1], sys.argv[2] or None
+src = json.load(open(os.path.join(dirpath, "model-catalog.json")))
+instructions = "You are a helpful coding assistant."
+if base_path and os.path.isfile(base_path):
+    with open(base_path, encoding="utf-8") as f:
+        content = f.read().strip()
+    if content:
+        instructions = content
+models = []
+for item in src.get("models", []):
+    slug = item.get("slug") or item.get("id")
+    if not slug:
+        continue
+    models.append({
+        "slug": slug,
+        "display_name": item.get("display_name") or slug,
+        "description": item.get("description"),
+        "default_reasoning_level": "low",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+            {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+            {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+        ],
+        "shell_type": "unified_exec",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 10,
+        "availability_nux": None,
+        "upgrade": None,
+        "default_reasoning_summary": "auto",
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "apply_patch_tool_type": None,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_image_detail_original": False,
+        "context_window": 272000,
+        "max_context_window": 272000,
+        "auto_compact_token_limit": None,
+        "comp_hash": None,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+        "supports_search_tool": False,
+        "use_responses_lite": False,
+        "node_repl_auto_review_required": False,
+        "node_repl_disabled": False,
+        "auto_review_model_override": None,
+        "model_specialty": None,
+        "tool_mode": None,
+        "multi_agent_version": None,
+        "multi_agent_reasoning_effort": None,
+        "model_messages": {
+            "persistent_instructions": None,
+            "tools": None,
+            "instructions_template": instructions,
+            "instructions_variables": None,
+            "approvals": None,
+            "collaboration_modes": None,
+            "auto_review": None,
+            "permissions": None,
+            "multi_agent": None,
+            "token_budget": None,
+            "confirmation_policies": None,
+            "guardian_v2": None,
+        },
+    })
+if not models:
+    sys.exit(1)
+out = os.path.join(dirpath, "model-catalog-codex.json")
+tmp = out + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump({"models": models}, f, indent=2, ensure_ascii=False)
+os.replace(tmp, out)
+os.chmod(out, 0o600)
+PY
+}
+
 setup_provider() {
     local name label base model wire keyvar key catalog dir
     read -r -p 'Provider name: ' name
@@ -164,7 +271,12 @@ run_provider() {
     export CODEX_HOME="$session_dir"
     export CODEX_PROVIDER_API_KEY="${!key_env}"
     cd "$session_dir"
+    local catalog_json=""
+    if ensure_codex_catalog "$dir"; then
+        catalog_json="$dir/model-catalog-codex.json"
+    fi
     cat > "$session_dir/config.toml" <<EOF
+$(if [ -n "$catalog_json" ]; then printf 'model_catalog_json = "%s"\n' "$catalog_json"; fi)
 model_provider = "$name"
 model = "$model"
 model_reasoning_effort = "low"
@@ -208,7 +320,7 @@ case "${1:-}" in
     menu) choose_provider ;;
     update) [ $# -ge 2 ] || die 'usage: codex-provider update NAME|all'; if [ "$2" = all ]; then for d in "$ROOT"/*; do [ -f "$d/provider.conf" ] || continue; unset name; . "$d/provider.conf"; update_provider_models "$name" || exit 1; done; else update_provider_models "$2"; fi ;;
     use) [ $# -ge 2 ] || die 'usage: codex-provider use NAME [args...]'; name="$2"; shift 2; run_provider "$name" "$@" ;;
-    resume) [ $# -ge 2 ] || die 'usage: codex-provider resume NAME [--last|--all|SESSION_ID]'; name="$2"; shift 2; run_provider "$name" resume "$@" ;;
+    resume) [ $# -ge 2 ] || die 'usage: codex-provider resume NAME [MODEL] [--last|--all|SESSION_ID]'; name="$2"; shift 2; if [ $# -gt 0 ] && [[ "$1" != --* ]]; then MODEL_OVERRIDE="$1"; shift; fi; run_provider "$name" resume "$@" ;;
     *) cat <<'EOF'
 Usage:
   codex-provider                 # menu, then resume the selected provider
@@ -217,7 +329,7 @@ Usage:
   codex-provider update NAME|all
   codex-provider list
   codex-provider use NAME [codex args...]
-  codex-provider resume NAME [--last|--all|SESSION_ID]
+  codex-provider resume NAME [MODEL] [--last|--all|SESSION_ID]
 EOF
     exit 1 ;;
 esac

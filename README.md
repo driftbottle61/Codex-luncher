@@ -38,6 +38,19 @@ codex-tokenhub-kimi-k3
 Selecting a model always attaches to that model's session. Detach without
 stopping Codex with `Ctrl-b`, then `d`.
 
+## In-session /model switching
+
+For custom providers, Codex can show the provider's model catalog in the
+in-session `/model` picker. When a provider has a `model-catalog.json`, the
+launcher converts it into Codex's internal catalog format and writes
+`model_catalog_json` into the session's `config.toml`, so `/model` lists those
+models instead of falling back to the bundled ChatGPT models.
+
+The conversion caches Codex's official base instructions once at
+`${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}/base-instructions.md`. If that
+download fails, a short fallback instruction is used. Restart the session after
+adding a model catalog for `/model` to pick up the new list.
+
 ## GitHub release
 
 Create an empty GitHub repository, then from this directory:
