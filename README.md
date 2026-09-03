@@ -80,8 +80,8 @@ Do not add provider configs, session data, API keys, or Codex auth files.
 ## SSH session picker menu
 
 `codex-provider recent` lists the 3 most recently active sessions across
-**all** providers/models (timestamped, newest first, each with its first
-message as a hint) and resumes the one you pick:
+**all** providers/models *and legacy Codex homes* (timestamped, newest first,
+each with its first message as a hint) and resumes the one you pick:
 
 ```bash
 codex-provider recent     # pick one of the 3 most recent sessions
@@ -92,7 +92,17 @@ codex-provider go         # skip the menu, auto-resume the single latest
 "Recent" means the newest recorded session activity (rollout file mtime), not
 just directory age, so an idle but freshly started session cannot shadow your
 real last conversation. Sessions whose tmux is still running are attached
-directly.
+directly. Legacy homes are ranked by the same activity clock and merged into
+the same list, so the truly newest session is always entry `#1` — even when it
+lives in an old plain-Codex home (`~/.codex`) rather than under a managed
+provider. `codex-provider go` uses the same merged ranking.
+
+`install.sh` installs this hook automatically: it detects any older SSH
+auto-enter hook left by a previous Codex setup (plain `codex`, `exec codex`, or
+an earlier `codex-provider go`/`recent` hook), disables it (the rc file is
+backed up first) and installs the canonical picker hook. Only when no hook
+existed at all does it leave the rc file untouched and print the snippet for
+you to add manually.
 
 Add this hook to the SSH login shell (`~/.profile` for root) so any SSH client
 lands in the session picker:

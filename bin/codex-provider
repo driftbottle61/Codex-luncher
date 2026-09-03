@@ -409,7 +409,7 @@ run_legacy_home() {
         printf 'codex-provider: warning: %s not set; resume may fail auth\n' "$envkey" >&2
     fi
     tag="$(printf '%s' "$home" | sed 's#^/##; s#/#-#g')"
-    tmux_name="codex-legacy-${tag//[^A-Za-z0-9_-]/-}"
+    tmux_name="codex-legacy-${tag//[^A-Za-z0-9_-]/-}-${sid//[^A-Za-z0-9_-]/-}"
     cd "$home"
     if [ ! -t 0 ]; then
         exec "$CODEX" -s danger-full-access resume "$sid"
@@ -474,23 +474,28 @@ newest_dir_under() {
     printf '%s' "$out"
 }
 
-top_sessions() {
-    # Prints the $1 most recently active session dirs across all providers as
-    # "ACTIVITY PATH" lines, newest first. Activity = newest rollout mtime.
-    local count="${1:-3}" d t
-    [ -d "$ROOT" ] || return 0
+catalog_sessions() {
+    # One session record per line, newest activity first, across managed
+    # providers and legacy homes:
+    #   m<TAB>epoch<TAB>session_dir                     (managed)
+    #   l<TAB>epoch<TAB>home<TAB>sid<TAB>cwd<TAB>first   (legacy)
+    local d t lgh mtime sid ts cwd first
     while IFS= read -r d; do
         t="$(dir_activity "$d")"
         [ -n "$t" ] || continue
-        printf '%s %s\n' "$t" "$d"
-    done < <(find "$ROOT" -type d -name 'new-*' -path '*/sessions/*' 2>/dev/null) | sort -nr | head -n "$count"
+        printf 'm\t%s\t%s\n' "${t%%.*}" "$d"
+    done < <(find "$ROOT" -type d -name 'new-*' -path '*/sessions/*' 2>/dev/null)
+    while IFS= read -r lgh; do
+        while IFS=$'\t' read -r mtime sid ts cwd first; do
+            printf 'l\t%s\t%s\t%s\t%s\t%s\n' "${mtime%.*}" "$lgh" "$sid" "$cwd" "$first"
+        done < <(list_home_sessions "$lgh")
+    done < <(find_legacy_homes)
 }
 
 go_latest() {
-    # Resume the single most recently active session across all providers.
-    # Attaches to its tmux if running, otherwise starts it in the background.
-    local line act dir name model
-    line="$(top_sessions 1)"
+    # Auto-resume the single most recently active session, managed or legacy.
+    local line kind act rest dir name model home sid cwd first
+    line="$(catalog_sessions | sort -t$'\t' -k2,2nr | head -1)"
     if [ -z "$line" ]; then
         local providers=0 pname=""
         for d in "$ROOT"/*; do
@@ -506,7 +511,15 @@ go_latest() {
         echo "no previous session found; run 'codex-provider' to pick one" >&2
         exit 1
     fi
-    dir="${line#* }"
+    kind="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    if [ "$kind" = l ]; then
+        IFS=$'\t' read -r act home sid cwd first <<<"$rest"
+        echo "resuming most recent session: legacy $(basename "$home") / ${sid%.jsonl}"
+        run_legacy_home "$home" "$sid"
+        exit $?
+    fi
+    IFS=$'\t' read -r act dir <<<"$rest"
     name="$(basename "$(dirname "$(dirname "$(dirname "$dir")")")")"
     model="$(basename "$(dirname "$dir")")"
     echo "resuming most recent session: $name / $model / $(basename "$dir")"
@@ -514,34 +527,20 @@ go_latest() {
 }
 
 pick_recent() {
-    local count="${1:-3}" i=0 sel line act act_fmt dir name model start suffix
-    local -a dirs=() acts=()
-    local -a lg_homes=() lg_sids=() lg_labels=()
-    local lgh mtime sid ts cwd first when lg_idx
+    # Menu over the most recent sessions (managed + legacy), merged and sorted
+    # by real activity so the truly newest session is always entry #1.
+    local count="${1:-3}" i=0 sel=0 line kind act rest total=0
+    local -a kinds=() dirs=() homes=() sids=() labels=() subs=()
+    local m_n=0 l_n=0 dir name model suffix start act_fmt title
+    local home sid cwd first when
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        acts+=("${line%% *}")
-        dirs+=("${line#* }")
-    done < <(top_sessions "$count")
-    while IFS= read -r lgh; do
-        while IFS=$'\t' read -r mtime sid ts cwd first; do
-            when="$(date -d "@${mtime%.*}" '+%m-%d %H:%M' 2>/dev/null || printf '%s' "${mtime%.*}")"
-            lg_homes+=("$lgh")
-            lg_sids+=("$sid")
-            lg_labels+=("$when  ${cwd:-?}  ${first:-}")
-        done < <(list_home_sessions "$lgh")
-    done < <(find_legacy_homes)
-    local total="${#dirs[@]}" lg_total="${#lg_sids[@]}"
-    local new_no=$((total + lg_total + 1))
-    if [ "$total" -eq 0 ] && [ "$lg_total" -eq 0 ]; then
-        echo 'no sessions recorded yet; starting a new session'
-        choose_provider
-        return 0
-    fi
-    while true; do
-        printf '\n最近 %d 个会话（按最后活跃排序，选编号进入）:\n' "$((total + lg_total))"
-        for ((i=0; i<total; i++)); do
-            dir="${dirs[$i]}"
+        kind="${line%%$'\t'*}"
+        rest="${line#*$'\t'}"
+        if [ "$kind" = m ]; then
+            [ "$m_n" -lt "$count" ] || continue
+            IFS=$'\t' read -r act dir <<<"$rest"
+            m_n=$((m_n + 1))
             suffix="$(basename "$dir")"
             start="${suffix#new-}"
             if [ "${#start}" -ge 12 ]; then
@@ -549,12 +548,12 @@ pick_recent() {
             fi
             name="$(basename "$(dirname "$(dirname "$(dirname "$dir")")")")"
             model="$(basename "$(dirname "$dir")")"
-            act="${acts[$i]%%.*}"
             act_fmt='?'
             [ -n "$act" ] && act_fmt="$(date -d "@$act" '+%m-%d %H:%M' 2>/dev/null || echo '?')"
-            printf '  %d) 开始 %s · %s/%s · 最后活跃 %s\n' "$((i+1))" "$start" "$name" "$model" "$act_fmt"
+            kinds+=(m); dirs+=("$dir"); homes+=(''); sids+=('')
+            labels+=("开始 $start · $name/$model · 最后活跃 $act_fmt")
+            title=''
             if [ -s "$dir/session_index.jsonl" ] && command -v python3 >/dev/null 2>&1; then
-                local title
                 title="$(python3 - "$dir/session_index.jsonl" <<'PY'
 import json, sys
 try:
@@ -564,11 +563,30 @@ except Exception:
     print('')
 PY
 )"
-                [ -n "$title" ] && printf '     标题: %s\n' "$title"
             fi
-        done
-        for ((i=0; i<lg_total; i++)); do
-            printf '  %d) %s · legacy %s\n' "$((total + i + 1))" "${lg_labels[$i]}" "${lg_homes[$i]}"
+            subs+=("$title")
+        else
+            [ "$l_n" -lt "$count" ] || continue
+            IFS=$'\t' read -r act home sid cwd first <<<"$rest"
+            l_n=$((l_n + 1))
+            when="$(date -d "@$act" '+%m-%d %H:%M' 2>/dev/null || printf '%s' "$act")"
+            kinds+=(l); dirs+=(''); homes+=("$home"); sids+=("$sid")
+            labels+=("$when  ${cwd:-?}  ${first:-} · legacy $home")
+            subs+=('')
+        fi
+    done < <(catalog_sessions | sort -t$'\t' -k2,2nr)
+    total="${#kinds[@]}"
+    local new_no=$((total + 1))
+    if [ "$total" -eq 0 ]; then
+        echo 'no sessions recorded yet; starting a new session'
+        choose_provider
+        return 0
+    fi
+    while true; do
+        printf '\n最近 %d 个会话（按最后活跃排序，选编号进入）:\n' "$total"
+        for ((i=0; i<total; i++)); do
+            printf '  %d) %s\n' "$((i+1))" "${labels[$i]}"
+            if [ -n "${subs[$i]}" ]; then printf '     标题: %s\n' "${subs[$i]}"; fi
         done
         printf '  %d) 新建会话（选择 provider/模型）\n' "$new_no"
         printf '  q) 退出到 shell\n'
@@ -578,22 +596,24 @@ PY
             ''|*[!0-9]*) echo '无效输入'; continue ;;
         esac
         if [ "$sel" -ge 1 ] && [ "$sel" -le "$total" ]; then
-            dir="${dirs[$((sel-1))]}"
-            name="$(basename "$(dirname "$(dirname "$(dirname "$dir")")")")"
-            model="$(basename "$(dirname "$dir")")"
-            echo "进入会话: $name / $model / $(basename "$dir")"
-            MODEL_OVERRIDE="$model" SESSION_SUFFIX="$(basename "$dir")" run_provider "$name" resume --last
-            exit $?
-        elif [ "$sel" -gt "$total" ] && [ "$sel" -le "$((total + lg_total))" ]; then
-            lg_idx=$((sel - total - 1))
-            echo "进入 legacy 会话: ${lg_homes[$lg_idx]}"
-            run_legacy_home "${lg_homes[$lg_idx]}" "${lg_sids[$lg_idx]}"
+            i=$((sel - 1))
+            if [ "${kinds[$i]}" = m ]; then
+                dir="${dirs[$i]}"
+                name="$(basename "$(dirname "$(dirname "$(dirname "$dir")")")")"
+                model="$(basename "$(dirname "$dir")")"
+                echo "进入会话: $name / $model / $(basename "$dir")"
+                MODEL_OVERRIDE="$model" SESSION_SUFFIX="$(basename "$dir")" run_provider "$name" resume --last
+            else
+                echo "进入 legacy 会话: ${sids[$i]} @ ${homes[$i]}"
+                run_legacy_home "${homes[$i]}" "${sids[$i]}"
+            fi
             exit $?
         elif [ "$sel" -eq "$new_no" ]; then
             choose_provider
             exit $?
+        else
+            echo '无效选择'
         fi
-        echo '无效选择'
     done
 }
 
