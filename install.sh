@@ -84,26 +84,41 @@ install_login_hook() {
         fi
         out=(); found_old=0; local first_artifact=1
         while IFS= read -r line; do
-            case "$line" in
-                *'codex-luncher:'*)
-                    found_old=1
-                    if [ "$first_artifact" = 1 ]; then
-                        first_artifact=0
-                        # older installs could comment a function body and leave
-                        # its `name() {` header dangling; comment that header too
-                        if [ "${#out[@]}" -gt 0 ]; then
-                            local prev="${out[$(( ${#out[@]} - 1 ))]}"
-                            case "$prev" in
-                                *'{'*) out[$(( ${#out[@]} - 1 ))]="# codex-luncher: removed old auto-enter hook: $prev" ;;
-                            esac
-                        fi
-                    fi
-                    continue  # drop the old artifact line
+            local stripped="${line#"${line%%[![:space:]]*}"}"
+            if [ -z "$stripped" ]; then
+                out+=("$line")   # keep blank lines
+                first_artifact=1
+                continue
+            fi
+            case "$stripped" in
+                \#*)
+                    # pure comment
+                    case "$line" in
+                        *'codex-luncher:'*)
+                            # old disabled/auto-enter comment artifact: drop it
+                            found_old=1
+                            if [ "$first_artifact" = 1 ]; then
+                                first_artifact=0
+                                # earlier installs could comment a function body
+                                # and leave its `name() {` header dangling
+                                if [ "${#out[@]}" -gt 0 ]; then
+                                    local prev="${out[$(( ${#out[@]} - 1 ))]}"
+                                    case "$prev" in
+                                        *'{'*) out[$(( ${#out[@]} - 1 ))]="# codex-luncher: removed old auto-enter hook: $prev" ;;
+                                    esac
+                                fi
+                            fi
+                            continue
+                            ;;
+                    esac
+                    out+=("$line")
+                    first_artifact=1
+                    continue
                     ;;
             esac
             first_artifact=1
-            case "$line" in
-                \#*) out+=("$line"); continue ;;  # keep unrelated comments
+            case "$stripped" in
+                ': '*) out+=("$line"); continue ;;  # already-neutralised no-op
             esac
             if [[ "$line" =~ (^|[;&|[:space:]])codex[a-zA-Z0-9_-]*([[:space:]]|$|&|;) ]]; then
                 # Replace, never delete: keeps function/if blocks balanced.
