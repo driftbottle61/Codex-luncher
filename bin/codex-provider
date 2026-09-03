@@ -185,28 +185,35 @@ list_providers() {
 }
 
 choose_provider() {
-    local dir choice name
-    local -a dirs=()
+    local dir name sel h idx action
+    local -a dirs=() items=() homes=()
     [ -d "$ROOT" ] || die 'no providers configured; run: codex-provider setup'
     auto_update_models
     for dir in "$ROOT"/*; do
         [ -f "$dir/provider.conf" ] || continue
-        dirs+=("$dir")
+        dirs+=("${dir##*/}")
     done
-    [ "${#dirs[@]}" -gt 0 ] || die 'no providers configured; run: codex-provider setup'
+    while IFS= read -r h; do homes+=("$h"); done < <(find_legacy_homes)
+    items=("${dirs[@]}")
+    [ "${#homes[@]}" -gt 0 ] && items+=('=> 恢复 legacy 历史会话 <=')
+    [ "${#items[@]}" -gt 0 ] || die 'no providers configured; run: codex-provider setup'
     PS3='Select provider (q to quit): '
-    select dir in "${dirs[@]##*/}"; do
-        if [ -n "${dir:-}" ]; then
-            printf 'Updating %s model catalog...\n' "$dir"
-            update_provider_models "$dir" || printf 'codex-provider: using cached model catalog\n' >&2
-            choose_model "$(provider_dir "$dir")"
+    select sel in "${items[@]}"; do
+        idx=$((REPLY - 1))
+        if [ -n "${sel:-}" ] && [ "$idx" -ge 0 ] && [ "$idx" -lt "${#dirs[@]}" ]; then
+            name="${dirs[$idx]}"
+            printf 'Updating %s model catalog...\n' "$name"
+            update_provider_models "$name" || printf 'codex-provider: using cached model catalog\n' >&2
+            choose_model "$(provider_dir "$name")"
             printf '1) resume latest session\n2) start a new session\n'
             read -r -p 'Select session action [1]: ' action
             case "${action:-1}" in
-                2) SESSION_SUFFIX="new-$(date +%Y%m%d-%H%M%S)" MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$dir" ;;
-                1) MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$dir" resume --last ;;
+                2) SESSION_SUFFIX="new-$(date +%Y%m%d-%H%M%S)" MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$name" ;;
+                1) MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$name" resume --last ;;
                 *) echo 'Invalid selection.' ;;
             esac
+        elif [ -n "${sel:-}" ] && [ "$idx" -eq "${#dirs[@]}" ] && [ "${#homes[@]}" -gt 0 ]; then
+            choose_legacy_any
         elif [ "$REPLY" = q ]; then
             exit 0
         else
@@ -313,6 +320,138 @@ EOF
     exec tmux attach-session -t "$tmux_name"
 }
 
+# ---- legacy codex homes (CODEX_HOMEs not managed by codex-provider) ----
+find_legacy_homes() {
+    local cand
+    local -a candidates=()
+    [ -n "${CODEX_HOME:-}" ] && candidates+=("$CODEX_HOME")
+    candidates+=("$HOME/.codex")
+    for cand in "${candidates[@]}"; do
+        case "$cand" in "$ROOT"/*) continue ;; esac
+        [ -d "$cand" ] || continue
+        [ -d "$cand/sessions" ] || [ -f "$cand/config.toml" ] || continue
+        find "$cand/sessions" -name '*.jsonl' 2>/dev/null | grep -q . || continue
+        printf '%s\n' "$cand"
+    done | sort -u
+}
+
+home_provider_model() {
+    local home="$1" mp="" model=""
+    [ -f "$home/config.toml" ] || { printf 'unknown unknown\n'; return; }
+    mp=$(sed -n 's/^model_provider[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$home/config.toml" | head -1)
+    model=$(sed -n 's/^model[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$home/config.toml" | head -1)
+    printf '%s %s\n' "${mp:-unknown}" "${model:-unknown}"
+}
+
+list_home_sessions() {
+    local home="$1"
+    python3 - "$home" <<'PY'
+import json, os, sys
+home = sys.argv[1]
+base = os.path.join(home, "sessions")
+if not os.path.isdir(base):
+    sys.exit(0)
+rows = []
+for root, _dirs, files in os.walk(base):
+    for fn in files:
+        if not fn.endswith(".jsonl"):
+            continue
+        p = os.path.join(root, fn)
+        try:
+            with open(p, encoding="utf-8") as f:
+                lines = f.readlines()
+            meta = json.loads(lines[0]) if lines else {}
+            payload = meta.get("payload", {})
+            sid = payload.get("session_id") or payload.get("id") or fn
+            ts = payload.get("timestamp", "")
+            cwd = payload.get("cwd", "")
+            first = ""
+            for ln in lines:
+                try:
+                    obj = json.loads(ln)
+                except Exception:
+                    continue
+                if obj.get("type") == "message" and obj.get("payload", {}).get("role") == "user":
+                    content = obj.get("payload", {}).get("content")
+                    if isinstance(content, str):
+                        first = content
+                    elif isinstance(content, list):
+                        first = "".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") == "input_text")
+                    break
+            first = " ".join(first.split())[:60]
+            rows.append((os.path.getmtime(p), sid, ts, cwd, first))
+        except Exception:
+            continue
+rows.sort(reverse=True)
+for mtime, sid, ts, cwd, first in rows:
+    print("%s\t%s\t%s\t%s\t%s" % (mtime, sid, ts, cwd, first))
+PY
+}
+
+run_legacy_home() {
+    local home="$1" sid="$2" mp="" pdir="" envkey="" tag tmux_name cmdline d
+    [ -d "$home" ] || die "codex home not found: $home"
+    [ -n "$sid" ] || die 'missing session id'
+    if [ -f "$home/config.toml" ]; then
+        mp=$(sed -n 's/^model_provider[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$home/config.toml" | head -1)
+        envkey=$(grep -m1 -oP 'env_key\s*=\s*"\K[^"]+' "$home/config.toml" || true)
+    fi
+    if [ -n "$envkey" ] && [ -z "${!envkey:-}" ]; then
+        if [ -n "$mp" ]; then
+            for d in "$ROOT"/*; do
+                [ "${d##*/}" = "$mp" ] && pdir="$d"
+            done
+            [ -z "$pdir" ] && pdir=$(find "$ROOT" -maxdepth 1 -type d -iname "$mp" 2>/dev/null | head -1)
+            [ -n "$pdir" ] && [ -f "$pdir/api-key" ] && export "$envkey=$(<"$pdir/api-key")"
+        fi
+    fi
+    if [ -n "$envkey" ] && [ -z "${!envkey:-}" ]; then
+        printf 'codex-provider: warning: %s not set; resume may fail auth\n' "$envkey" >&2
+    fi
+    tag="$(printf '%s' "$home" | sed 's#^/##; s#/#-#g')"
+    tmux_name="codex-legacy-${tag//[^A-Za-z0-9_-]/-}"
+    cd "$home"
+    if [ ! -t 0 ]; then
+        exec "$CODEX" -s danger-full-access resume "$sid"
+    fi
+    if tmux has-session -t "$tmux_name" 2>/dev/null; then
+        exec tmux attach-session -t "$tmux_name"
+    fi
+    printf -v cmdline '%q ' "$CODEX" -s danger-full-access resume "$sid"
+    if [ -n "$envkey" ] && [ -n "${!envkey:-}" ]; then
+        tmux new-session -d -s "$tmux_name" -c "$home" \
+            -e "CODEX_HOME=$home" -e "$envkey=${!envkey}" "$cmdline"
+    else
+        tmux new-session -d -s "$tmux_name" -c "$home" \
+            -e "CODEX_HOME=$home" "$cmdline"
+    fi
+    exec tmux attach-session -t "$tmux_name"
+}
+
+choose_legacy_any() {
+    local lgh mtime sid ts cwd first when sel
+    local -a homes=() sids=() labels=()
+    while IFS= read -r lgh; do
+        while IFS=$'\t' read -r mtime sid ts cwd first; do
+            when="$(date -d "@${mtime%.*}" '+%m-%d %H:%M' 2>/dev/null || printf '%s' "${mtime%.*}")"
+            homes+=("$lgh")
+            sids+=("$sid")
+            labels+=("$when  ${cwd:-?}  ${first:-}")
+        done < <(list_home_sessions "$lgh")
+    done < <(find_legacy_homes)
+    [ "${#sids[@]}" -gt 0 ] || { echo 'no legacy sessions found'; return 1; }
+    PS3='Select legacy session to resume (q to quit): '
+    select sel in "${labels[@]}"; do
+        if [ -n "${sel:-}" ]; then
+            run_legacy_home "${homes[$((REPLY - 1))]}" "${sids[$((REPLY - 1))]}"
+        elif [ "$REPLY" = q ]; then
+            return 0
+        else
+            echo 'Invalid selection.'
+        fi
+    done
+}
+
 dir_activity() {
     # Prints the epoch of the newest rollout file under a session dir, falling
     # back to the dir mtime when no rollout exists yet.
@@ -375,22 +514,32 @@ go_latest() {
 }
 
 pick_recent() {
-    # Interactive menu: pick one of the N (default 3) most recent sessions.
     local count="${1:-3}" i=0 sel line act act_fmt dir name model start suffix
     local -a dirs=() acts=()
+    local -a lg_homes=() lg_sids=() lg_labels=()
+    local lgh mtime sid ts cwd first when lg_idx
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         acts+=("${line%% *}")
         dirs+=("${line#* }")
     done < <(top_sessions "$count")
-    if [ "${#dirs[@]}" -eq 0 ]; then
+    while IFS= read -r lgh; do
+        while IFS=$'\t' read -r mtime sid ts cwd first; do
+            when="$(date -d "@${mtime%.*}" '+%m-%d %H:%M' 2>/dev/null || printf '%s' "${mtime%.*}")"
+            lg_homes+=("$lgh")
+            lg_sids+=("$sid")
+            lg_labels+=("$when  ${cwd:-?}  ${first:-}")
+        done < <(list_home_sessions "$lgh")
+    done < <(find_legacy_homes)
+    local total="${#dirs[@]}" lg_total="${#lg_sids[@]}"
+    local new_no=$((total + lg_total + 1))
+    if [ "$total" -eq 0 ] && [ "$lg_total" -eq 0 ]; then
         echo 'no sessions recorded yet; starting a new session'
         choose_provider
         return 0
     fi
-    local total="${#dirs[@]}"
     while true; do
-        printf '\n最近 %d 个会话（按最后活跃排序，选编号进入）:\n' "$total"
+        printf '\n最近 %d 个会话（按最后活跃排序，选编号进入）:\n' "$((total + lg_total))"
         for ((i=0; i<total; i++)); do
             dir="${dirs[$i]}"
             suffix="$(basename "$dir")"
@@ -418,7 +567,10 @@ PY
                 [ -n "$title" ] && printf '     标题: %s\n' "$title"
             fi
         done
-        printf '  %d) 新建会话（选择 provider/模型）\n' "$((total+1))"
+        for ((i=0; i<lg_total; i++)); do
+            printf '  %d) %s · legacy %s\n' "$((total + i + 1))" "${lg_labels[$i]}" "${lg_homes[$i]}"
+        done
+        printf '  %d) 新建会话（选择 provider/模型）\n' "$new_no"
         printf '  q) 退出到 shell\n'
         read -r -p '选择: ' sel || exit 0
         case "$sel" in
@@ -432,7 +584,12 @@ PY
             echo "进入会话: $name / $model / $(basename "$dir")"
             MODEL_OVERRIDE="$model" SESSION_SUFFIX="$(basename "$dir")" run_provider "$name" resume --last
             exit $?
-        elif [ "$sel" -eq "$((total+1))" ]; then
+        elif [ "$sel" -gt "$total" ] && [ "$sel" -le "$((total + lg_total))" ]; then
+            lg_idx=$((sel - total - 1))
+            echo "进入 legacy 会话: ${lg_homes[$lg_idx]}"
+            run_legacy_home "${lg_homes[$lg_idx]}" "${lg_sids[$lg_idx]}"
+            exit $?
+        elif [ "$sel" -eq "$new_no" ]; then
             choose_provider
             exit $?
         fi

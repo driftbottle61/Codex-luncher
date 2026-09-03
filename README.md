@@ -30,6 +30,7 @@ The launcher is installed as `/usr/local/bin/codex-provider`.
 codex-provider          # interactive provider/model/session menu
 codex-provider setup    # add or update a provider
 codex-provider list     # list configured providers
+codex-provider go       # auto-resume the single most recent session
 codex-provider recent   # pick one of the 3 most recent sessions
 codex-provider resume tokenhub --last
 ```
@@ -109,3 +110,10 @@ fi
   provider/model picker (`codex-provider menu`).
 - Escape hatch for an admin shell without Codex:
   `ssh -t root@host 'CODEX_SKIP=1 bash -l'`
+
+Legacy Codex homes are detected too: any `$CODEX_HOME` or `~/.codex` outside
+the provider root that contains `sessions/*.jsonl` is scanned, and its sessions
+appear alongside the managed ones in both `recent` and the interactive menu
+(shown as a `=> 恢复 legacy 历史会话 <=` entry). Legacy sessions are resumed
+with their own `config.toml` provider/key settings, so they work even if the
+provider was never added to `codex-provider`.
