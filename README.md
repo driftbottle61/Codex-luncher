@@ -101,8 +101,11 @@ provider. `codex-provider go` uses the same merged ranking.
 `~/.bash_profile` and `~/.bashrc` (SSH login shells source both), disables any
 older auto-enter hook left by a previous Codex setup (plain `codex`,
 `exec codex`, or an earlier `codex-provider go`/`recent` hook — each modified
-file is backed up first) and enables the canonical picker hook in the login rc
-file. Re-running the installer is safe: an already-active hook is left as is.
+file is backed up first). Auto-run lines are replaced with harmless no-ops
+instead of being deleted, so function/if blocks in the rc file stay
+syntactically valid; the result is syntax-checked before being kept. The
+installer then enables the canonical picker hook in the login rc file.
+Re-running the installer is safe: an already-active hook is left as is.
 
 Add this hook to the SSH login shell (`~/.profile` for root) so any SSH client
 lands in the session picker:

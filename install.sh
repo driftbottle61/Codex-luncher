@@ -63,7 +63,7 @@ echo "Installed $TARGET"
 # and disable them all; otherwise SSH would keep jumping into the *old* Codex
 # session instead of the newest one.
 install_login_hook() {
-    local f="" line in_block=0 found_old=0
+    local f="" line found_old=0
     local target="" rc=""
     local -a scan=() out=()
     for rc in "$HOME/.profile" "$HOME/.bash_profile"; do
@@ -73,46 +73,60 @@ install_login_hook() {
     scan=("$target")
     [ -f "$HOME/.bashrc" ] && scan+=("$HOME/.bashrc")
 
-    # 1) disable any older codex auto-enter hooks in every rc file
+    # 1) neutralise older codex auto-enter hooks in every rc file:
+    #    - drop leftover '# codex-luncher:' artifacts from previous installs
+    #      (and comment a dangling `foo() {` header they may have left behind)
+    #    - comment any top-level command that starts with `codex`
+    #      (`exec codex`, `codex-provider go/recent`, `codex resume`, ...)
     for f in "${scan[@]}"; do
         if grep -q 'codex-luncher: SSH 交互登录显示' "$f" 2>/dev/null; then
             continue  # this file already carries the canonical hook
         fi
-        out=(); found_old=0; in_block=0
+        out=(); found_old=0; local first_artifact=1
         while IFS= read -r line; do
             case "$line" in
                 *'codex-luncher:'*)
-                    in_block=1; found_old=1
-                    out+=("# codex-luncher: disabled old auto-enter hook: $line")
-                    continue
+                    found_old=1
+                    if [ "$first_artifact" = 1 ]; then
+                        first_artifact=0
+                        # older installs could comment a function body and leave
+                        # its `name() {` header dangling; comment that header too
+                        if [ "${#out[@]}" -gt 0 ]; then
+                            local prev="${out[$(( ${#out[@]} - 1 ))]}"
+                            case "$prev" in
+                                *'{'*) out[$(( ${#out[@]} - 1 ))]="# codex-luncher: removed old auto-enter hook: $prev" ;;
+                            esac
+                        fi
+                    fi
+                    continue  # drop the old artifact line
                     ;;
             esac
-            if [ "$in_block" = 1 ]; then
-                out+=("# codex-luncher: disabled old auto-enter hook: $line")
-                case "$line" in
-                    *fi*) in_block=0 ;;
-                esac
-                continue
-            fi
+            first_artifact=1
             case "$line" in
                 \#*) out+=("$line"); continue ;;  # keep unrelated comments
             esac
-            if [[ "$line" =~ (^|[;&|[:space:]])(exec[[:space:]]+)?codex(-provider)?([[:space:]]|$) ]] \
-               || [[ "$line" =~ codex-provider[[:space:]]+(go|recent|resume|menu) ]]; then
-                out+=("# codex-luncher: disabled old ssh codex hook: $line")
+            if [[ "$line" =~ (^|[;&|[:space:]])codex[a-zA-Z0-9_-]*([[:space:]]|$|&|;) ]]; then
+                # Replace, never delete: keeps function/if blocks balanced.
+                out+=(": # codex-luncher: disabled old ssh codex hook: $line")
                 found_old=1
                 continue
             fi
             out+=("$line")
         done < "$f" 2>/dev/null || true
         if [ "$found_old" = 1 ]; then
-            cp -a "$f" "$f.bak-install-$(date +%Y%m%d-%H%M%S)"
+            local bak="$f.bak-install-$(date +%Y%m%d-%H%M%S)"
+            cp -a "$f" "$bak"
             printf '%s\n' "${out[@]}" > "$f"
-            echo "codex-luncher: disabled old ssh hooks in $f (backup saved)"
+            if ! bash -n "$f" 2>/dev/null; then
+                cp -a "$bak" "$f"
+                echo "codex-luncher: WARNING: could not rewrite $f safely, original restored (backup: $bak)"
+            else
+                echo "codex-luncher: disabled old ssh hooks in $f (backup: $bak)"
+            fi
         fi
     done
 
-    # 2) make sure the canonical hook is active in the login rc file
+# 2) make sure the canonical hook is active in the login rc file
     if grep -q 'codex-luncher: SSH 交互登录显示' "$target" 2>/dev/null; then
         echo "codex-luncher: ssh login hook already active in $target"
         return 0
