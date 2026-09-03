@@ -118,6 +118,9 @@ fi
   a fresh Codex that resumes the same session.
 - The last menu entry starts a new session through the original
   provider/model picker (`codex-provider menu`).
+- First run is self-guiding: when no provider and no session exists yet, the
+  picker drops straight into the interactive provider setup (`codex-provider
+  setup`) instead of exiting; afterwards it returns to the menu.
 - Escape hatch for an admin shell without Codex:
   `ssh -t root@host 'CODEX_SKIP=1 bash -l'`
 

@@ -187,33 +187,44 @@ list_providers() {
 choose_provider() {
     local dir name sel h idx action
     local -a dirs=() items=() homes=()
-    [ -d "$ROOT" ] || die 'no providers configured; run: codex-provider setup'
-    auto_update_models
-    for dir in "$ROOT"/*; do
-        [ -f "$dir/provider.conf" ] || continue
-        dirs+=("${dir##*/}")
-    done
+    if [ -d "$ROOT" ]; then
+        auto_update_models
+        for dir in "$ROOT"/*; do
+            [ -f "$dir/provider.conf" ] || continue
+            dirs+=("${dir##*/}")
+        done
+    fi
     while IFS= read -r h; do homes+=("$h"); done < <(find_legacy_homes)
     items=("${dirs[@]}")
     [ "${#homes[@]}" -gt 0 ] && items+=('=> 恢复 legacy 历史会话 <=')
-    [ "${#items[@]}" -gt 0 ] || die 'no providers configured; run: codex-provider setup'
+    if [ "${#items[@]}" -eq 0 ]; then
+        printf '\ncodex-provider: 未检测到任何 provider 或历史会话——首次使用，先添加一个 provider。\n'
+        printf '（Ctrl-C 可退出；添加完成后会自动回到菜单）\n'
+        setup_provider
+        choose_provider
+        return 0
+    fi
     PS3='Select provider (q to quit): '
     select sel in "${items[@]}"; do
-        idx=$((REPLY - 1))
-        if [ -n "${sel:-}" ] && [ "$idx" -ge 0 ] && [ "$idx" -lt "${#dirs[@]}" ]; then
-            name="${dirs[$idx]}"
-            printf 'Updating %s model catalog...\n' "$name"
-            update_provider_models "$name" || printf 'codex-provider: using cached model catalog\n' >&2
-            choose_model "$(provider_dir "$name")"
-            printf '1) resume latest session\n2) start a new session\n'
-            read -r -p 'Select session action [1]: ' action
-            case "${action:-1}" in
-                2) SESSION_SUFFIX="new-$(date +%Y%m%d-%H%M%S)" MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$name" ;;
-                1) MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$name" resume --last ;;
-                *) echo 'Invalid selection.' ;;
-            esac
-        elif [ -n "${sel:-}" ] && [ "$idx" -eq "${#dirs[@]}" ] && [ "${#homes[@]}" -gt 0 ]; then
-            choose_legacy_any
+        if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
+            idx=$((REPLY - 1))
+            if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#dirs[@]}" ]; then
+                name="${dirs[$idx]}"
+                printf 'Updating %s model catalog...\n' "$name"
+                update_provider_models "$name" || printf 'codex-provider: using cached model catalog\n' >&2
+                choose_model "$(provider_dir "$name")"
+                printf '1) resume latest session\n2) start a new session\n'
+                read -r -p 'Select session action [1]: ' action
+                case "${action:-1}" in
+                    2) SESSION_SUFFIX="new-$(date +%Y%m%d-%H%M%S)" MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$name" ;;
+                    1) MODEL_OVERRIDE="$SELECTED_MODEL" run_provider "$name" resume --last ;;
+                    *) echo 'Invalid selection.' ;;
+                esac
+            elif [ "$idx" -eq "${#dirs[@]}" ] && [ "${#homes[@]}" -gt 0 ]; then
+                choose_legacy_any
+            else
+                echo 'Invalid selection.'
+            fi
         elif [ "$REPLY" = q ]; then
             exit 0
         else
@@ -578,7 +589,7 @@ PY
     total="${#kinds[@]}"
     local new_no=$((total + 1))
     if [ "$total" -eq 0 ]; then
-        echo 'no sessions recorded yet; starting a new session'
+        printf '\n还没有可恢复的会话。'
         choose_provider
         return 0
     fi
