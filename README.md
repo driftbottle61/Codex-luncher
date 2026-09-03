@@ -30,6 +30,7 @@ The launcher is installed as `/usr/local/bin/codex-provider`.
 codex-provider          # interactive provider/model/session menu
 codex-provider setup    # add or update a provider
 codex-provider list     # list configured providers
+codex-provider recent   # pick one of the 3 most recent sessions
 codex-provider resume tokenhub --last
 ```
 
@@ -74,3 +75,37 @@ git push -u origin main
 ```
 
 Do not add provider configs, session data, API keys, or Codex auth files.
+
+## SSH session picker menu
+
+`codex-provider recent` lists the 3 most recently active sessions across
+**all** providers/models (timestamped, newest first, each with its first
+message as a hint) and resumes the one you pick:
+
+```bash
+codex-provider recent     # pick one of the 3 most recent sessions
+codex-provider recent 5   # show the 5 most recent sessions
+codex-provider go         # skip the menu, auto-resume the single latest
+```
+
+"Recent" means the newest recorded session activity (rollout file mtime), not
+just directory age, so an idle but freshly started session cannot shadow your
+real last conversation. Sessions whose tmux is still running are attached
+directly.
+
+Add this hook to the SSH login shell (`~/.profile` for root) so any SSH client
+lands in the session picker:
+
+```bash
+if [ -n "$SSH_CONNECTION" ] && [ -t 0 ] && [ -z "$TMUX" ] && [ -z "$CODEX_SKIP" ]; then
+    codex-provider recent || true
+fi
+```
+
+- Detaching with `Ctrl-b d` returns to the login shell (normal admin shell).
+- Exiting Codex inside tmux closes the window; the next `recent`/`go` restarts
+  a fresh Codex that resumes the same session.
+- The last menu entry starts a new session through the original
+  provider/model picker (`codex-provider menu`).
+- Escape hatch for an admin shell without Codex:
+  `ssh -t root@host 'CODEX_SKIP=1 bash -l'`
