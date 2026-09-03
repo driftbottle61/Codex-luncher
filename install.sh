@@ -157,3 +157,17 @@ detect_legacy_homes() {
 
 install_login_hook
 detect_legacy_homes
+
+# 3) one-click install should not drop back to the shell: enter the menu.
+#    `curl ... | bash` feeds install.sh from a pipe, so re-point stdin at the
+#    controlling terminal before launching the interactive menu.
+launch_menu() {
+    if [ -e /dev/tty ] && [ -t 1 ]; then
+        echo
+        echo "codex-luncher: 安装完成，进入菜单（q 退出回 shell）。"
+        exec codex-provider recent < /dev/tty
+    else
+        echo "codex-luncher: 安装完成。交互式终端里会自动进入菜单；SSH 登录也会进入会话菜单。"
+    fi
+}
+launch_menu

@@ -24,6 +24,12 @@ sudo ./install.sh
 
 The launcher is installed as `/usr/local/bin/codex-provider`.
 
+When run from an interactive terminal the installer drops you straight into
+the session menu when it finishes (`codex-provider recent`, which shows the
+resume picker when sessions exist and the provider setup otherwise); press `q`
+to leave the menu back to the shell. On non-interactive installs it simply
+finishes and prints the SSH note.
+
 ## Usage
 
 ```bash
