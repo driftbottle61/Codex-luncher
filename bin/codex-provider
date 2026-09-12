@@ -8,7 +8,8 @@ valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 provider_dir() { printf '%s/%s' "$ROOT" "$1"; }
 
 update_provider_models() {
-    local pname="$1" dir keyvar tmp
+    # $2 = merge（默认，保留本地已有条目，上游新增的追加在后）/ replace（纯上游列表）
+    local pname="$1" mode="${2:-merge}" dir keyvar tmp merged oldjson kept
     dir="$(provider_dir "$pname")"
     [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
     unset name label base_url model wire_api key_env
@@ -18,10 +19,56 @@ update_provider_models() {
     [ -n "${!keyvar:-}" ] || die "environment variable $keyvar is not set and no saved key exists"
     command -v curl >/dev/null 2>&1 || die 'curl is required to update models'
     command -v jq >/dev/null 2>&1 || die 'jq is required to update models'
-    tmp="$(mktemp)"
-    if ! curl -fsSL --max-time 30 -H "Authorization: Bearer ${!keyvar}" "$base_url/models" -o "$tmp"; then rm -f "$tmp"; return 1; fi
-    jq -e '{models: [(.data // .models // [])[] | (.id // .slug) as $id | select($id != null) | {slug:$id,id:$id,display_name:(.name // $id)}]}' "$tmp" > "$dir/model-catalog.json" || { rm -f "$tmp"; return 1; }
-    chmod 600 "$dir/model-catalog.json"; rm -f "$tmp"; printf 'Updated model catalog: %s\n' "$dir/model-catalog.json"
+    tmp="$(mktemp)"; merged="$(mktemp)"
+    if ! curl -fsSL --max-time 30 -H "Authorization: Bearer ${!keyvar}" "$base_url/models" -o "$tmp"; then
+        rm -f "$tmp" "$merged"; return 1
+    fi
+    # 合并策略：本地条目按原顺序在前（手工挑选/自建的模型不会被一次刷新抹掉），
+    # 上游返回而本地没有的追加在后面。本地目录缺失或损坏则退回纯上游列表。
+    oldjson='{"models":[]}'
+    if [ "$mode" != replace ] && [ -f "$dir/model-catalog.json" ]; then
+        oldjson="$(<"$dir/model-catalog.json")"
+    fi
+    if ! jq -e --argjson old "$oldjson" '
+          def uniqbyid: reduce .[] as $x ([]; if any(.[]; .id == $x.id) then . else . + [$x] end);
+          [ (($old.models // [])[]),
+            ((.data // .models // [])[] | (.id // .slug) as $id | select($id != null) | {slug:$id,id:$id,display_name:(.name // $id)}) ]
+          | uniqbyid | {models: .}
+        ' "$tmp" > "$merged" 2>/dev/null; then
+        jq -e '{models: [(.data // .models // [])[] | (.id // .slug) as $id | select($id != null) | {slug:$id,id:$id,display_name:(.name // $id)}]}' "$tmp" > "$merged" || { rm -f "$tmp" "$merged"; return 1; }
+    fi
+    # 上游这次没返回、但本地原有的条目（= 本次被保留下来的），提示一下
+    kept=''
+    if [ "$mode" != replace ]; then
+        kept="$(jq -r --argjson old "$oldjson" '
+              [(.data // .models // [])[] | (.id // .slug) | select(. != null)] as $n
+              | [($old.models // [])[].id | select(. as $i | ($n | index($i)) == null)] | join(", ")
+            ' "$tmp" 2>/dev/null || true)"
+    fi
+    # 兜底：空目录会让 codex 直接启动失败（model_catalog_json must contain at least one model）
+    if ! jq -e '.models | length > 0' "$merged" >/dev/null 2>&1; then
+        rm -f "$tmp" "$merged"
+        printf 'codex-provider: 上游返回的模型列表为空，保留现有目录不动\n' >&2
+        return 1
+    fi
+    chmod 600 "$merged"; mv -f "$merged" "$dir/model-catalog.json"; rm -f "$tmp"
+    printf 'Updated model catalog: %s\n' "$dir/model-catalog.json"
+    if [ -n "$kept" ]; then
+        printf 'codex-provider: 上游未返回但已保留本地条目: %s（要清掉请用 update %s --replace）\n' "$kept" "$pname" >&2
+    fi
+    return 0
+}
+
+refresh_models_once() {
+    # 进入会话前刷新该 provider 的模型列表。$2=1 表示显式刷新（忽略开关）。
+    # 失败绝不阻断进入会话；同一 provider 在一次进程里只刷一次。
+    local pname="$1" force="${2:-0}"
+    if [ "$force" != 1 ] && [ "${CODEX_PROVIDER_REFRESH_ON_SESSION:-1}" != 1 ]; then return 0; fi
+    case " ${MODELS_REFRESHED:-} " in *" $pname "*) return 0 ;; esac
+    MODELS_REFRESHED="${MODELS_REFRESHED:-} $pname"
+    printf '刷新 %s 的模型列表...\n' "$pname"
+    update_provider_models "$pname" || printf 'codex-provider: 模型列表刷新失败（网络或密钥问题），继续用本地缓存\n' >&2
+    return 0
 }
 
 auto_update_models() {
@@ -210,8 +257,7 @@ choose_provider() {
             idx=$((REPLY - 1))
             if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#dirs[@]}" ]; then
                 name="${dirs[$idx]}"
-                printf 'Updating %s model catalog...\n' "$name"
-                update_provider_models "$name" || printf 'codex-provider: using cached model catalog\n' >&2
+                refresh_models_once "$name" 1
                 choose_model "$(provider_dir "$name")"
                 printf '1) resume latest session\n2) start a new session\n'
                 read -r -p 'Select session action [1]: ' action
@@ -269,7 +315,7 @@ PY
 
 run_provider() {
     local name="$1"; shift
-    local dir="$(provider_dir "$name")"
+    local dir="$(provider_dir "$name")" pname="$name"
     [ -f "$dir/provider.conf" ] || die "unknown provider: $name"
     unset name label base_url model wire_api key_env
     . "$dir/provider.conf"
@@ -278,6 +324,7 @@ run_provider() {
         export "$key_env=$(<"$dir/api-key")"
     fi
     [ -n "${!key_env:-}" ] || die "environment variable $key_env is not set and no saved key exists"
+    refresh_models_once "$pname"
     if [ "${1:-}" = resume ] && [ -z "${SESSION_SUFFIX:-}" ]; then
         local latest_suffix
         latest_suffix="$(newest_dir_under "$dir/sessions/$model")"
@@ -635,7 +682,26 @@ case "${1:-}" in
     menu) choose_provider ;;
     go) shift; go_latest ;;
     recent) shift; pick_recent "${1:-3}" ;;
-    update) [ $# -ge 2 ] || die 'usage: codex-provider update NAME|all'; if [ "$2" = all ]; then for d in "$ROOT"/*; do [ -f "$d/provider.conf" ] || continue; unset name; . "$d/provider.conf"; update_provider_models "$name" || exit 1; done; else update_provider_models "$2"; fi ;;
+    update)
+        shift
+        update_mode=merge; update_target=''
+        for a in "$@"; do
+            case "$a" in
+                --replace) update_mode=replace ;;
+                --*) die "unknown option: $a" ;;
+                *) if [ -z "$update_target" ]; then update_target="$a"; fi ;;
+            esac
+        done
+        [ -n "$update_target" ] || die 'usage: codex-provider update NAME|all [--replace]'
+        if [ "$update_target" = all ]; then
+            for d in "$ROOT"/*; do
+                [ -f "$d/provider.conf" ] || continue
+                unset name; . "$d/provider.conf"
+                update_provider_models "$name" "$update_mode" || exit 1
+            done
+        else
+            update_provider_models "$update_target" "$update_mode"
+        fi ;;
     use) [ $# -ge 2 ] || die 'usage: codex-provider use NAME [args...]'; name="$2"; shift 2; run_provider "$name" "$@" ;;
     resume) [ $# -ge 2 ] || die 'usage: codex-provider resume NAME [MODEL] [--last|--all|SESSION_ID]'; name="$2"; shift 2; if [ $# -gt 0 ] && [[ "$1" != --* ]]; then MODEL_OVERRIDE="$1"; shift; fi; run_provider "$name" resume "$@" ;;
     *) cat <<'EOF'
@@ -643,7 +709,8 @@ Usage:
   codex-provider                 # menu, then resume the selected provider
   codex-provider menu            # same as above
   codex-provider setup
-  codex-provider update NAME|all
+  codex-provider update NAME|all [--replace]
+                                       # refresh model catalog (default: merge, keep local-only entries)
   codex-provider list
   codex-provider go               # auto-resume the single most recent session
   codex-provider recent [N]       # pick from the N (default 3) most recent sessions

@@ -39,6 +39,8 @@ codex-provider list     # list configured providers
 codex-provider go       # auto-resume the single most recent session
 codex-provider recent   # pick one of the 3 most recent sessions
 codex-provider resume tokenhub --last
+codex-provider update tokenhub           # refresh that provider's model catalog
+codex-provider update all --replace      # refresh all, drop local-only entries
 ```
 
 Provider data is stored under `${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}`.
@@ -67,6 +69,21 @@ The conversion caches Codex's official base instructions once at
 `${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}/base-instructions.md`. If that
 download fails, a short fallback instruction is used. Restart the session after
 adding a model catalog for `/model` to pick up the new list.
+
+Refreshing a provider's catalog (`codex-provider update NAME`, and the refresh
+that runs automatically when you pick a provider in the menu) **merges**: your
+existing entries keep their order, upstream models that you do not have are
+appended, and anything upstream no longer returns is kept and reported rather
+than dropped - so hand-picked or provider-specific models survive a refresh.
+Pass `--replace` to force the catalog to exactly the upstream list.
+
+Entering a session - the `recent` picker, `go`, `resume`, `use` and the provider
+menu - also refreshes that provider's catalog first, so the in-session `/model`
+list is current. It runs once per provider per run, never blocks the session
+(if the API or key is bad you just get a warning and the cached catalog is
+used), and never writes an empty catalog (Codex refuses to start when
+`model_catalog_json` has no models). Set `CODEX_PROVIDER_REFRESH_ON_SESSION=0`
+to skip it; the provider menu's own refresh is unaffected by that switch.
 
 ## GitHub release
 
