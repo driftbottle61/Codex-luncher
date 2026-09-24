@@ -3,13 +3,19 @@ set -Eeuo pipefail
 
 ROOT="${CODEX_PROVIDER_ROOT:-/root/.codex-providers}"
 CODEX="$(command -v codex)"
+# 环境里残留的 MODEL_OVERRIDE / SESSION_SUFFIX（例如从某个 codex tmux 会话继承来的）
+# 会悄悄改写本次要进入的模型和会话目录，这里先清掉；本脚本内部调用时会显式传入。
+unset MODEL_OVERRIDE SESSION_SUFFIX
 die() { printf 'codex-provider: %s\n' "$*" >&2; exit 1; }
 valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 provider_dir() { printf '%s/%s' "$ROOT" "$1"; }
 
 update_provider_models() {
     # $2 = merge（默认，保留本地已有条目，上游新增的追加在后）/ replace（纯上游列表）
+    # name/label/... 必须声明为 local：本函数会重新 source provider.conf，
+    # 否则会把调用方（run_provider）刚算好的 $model 覆盖成 provider 的默认模型。
     local pname="$1" mode="${2:-merge}" dir keyvar tmp merged oldjson kept
+    local name label base_url model wire_api key_env
     dir="$(provider_dir "$pname")"
     [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
     unset name label base_url model wire_api key_env
@@ -224,6 +230,7 @@ EOF
 list_providers() {
     [ -d "$ROOT" ] || { echo 'No providers configured.'; return; }
     for dir in "$ROOT"/*; do
+        local name label base_url model wire_api key_env
         [ -f "$dir/provider.conf" ] || continue
         unset name label base_url model wire_api key_env
         . "$dir/provider.conf"
@@ -316,8 +323,9 @@ PY
 run_provider() {
     local name="$1"; shift
     local dir="$(provider_dir "$name")" pname="$name"
+    local label base_url model wire_api key_env
     [ -f "$dir/provider.conf" ] || die "unknown provider: $name"
-    unset name label base_url model wire_api key_env
+    label=""; base_url=""; model=""; wire_api=""; key_env=""
     . "$dir/provider.conf"
     model="${MODEL_OVERRIDE:-$model}"
     if [ -z "${!key_env:-}" ] && [ -f "$dir/api-key" ]; then
@@ -325,6 +333,9 @@ run_provider() {
     fi
     [ -n "${!key_env:-}" ] || die "environment variable $key_env is not set and no saved key exists"
     refresh_models_once "$pname"
+    # refresh_models_once 会重新读 provider.conf；万一它动了 $model，这里把
+    # 用户/菜单选定的模型再确认一次，免得会话被写进 provider 默认模型的目录。
+    model="${MODEL_OVERRIDE:-$model}"
     if [ "${1:-}" = resume ] && [ -z "${SESSION_SUFFIX:-}" ]; then
         local latest_suffix
         latest_suffix="$(newest_dir_under "$dir/sessions/$model")"
@@ -511,12 +522,31 @@ choose_legacy_any() {
 }
 
 dir_activity() {
-    # Prints the epoch of the newest rollout file under a session dir, falling
-    # back to the dir mtime when no rollout exists yet.
-    local d="$1" t
-    t="$(find "$d/sessions" -type f -name 'rollout-*.jsonl' -printf '%T@\n' 2>/dev/null | sort -nr | head -1)"
-    [ -n "$t" ] || t="$(stat -c %Y "$d" 2>/dev/null)"
-    printf '%s' "$t"
+    # Prints the epoch of the newest HOME-LOCAL activity in a session dir.
+    # Do NOT trust rollout mtime as the primary signal: threads.rollout_path is
+    # absolute and can point OUTSIDE this home (that is what happens when a
+    # home gets copied to another model dir), so a busy dir would rank on a
+    # file it does not own. history.jsonl / state_5.sqlite(-wal) / config.toml
+    # are only ever written by the home that is actually running (config.toml
+    # is rewritten by run_provider on every launch), so use those first; the
+    # local rollout and the dir mtime remain as fallbacks.
+    local d="$1" t best=0 f
+    for f in "$d/history.jsonl" "$d/state_5.sqlite" "$d/state_5.sqlite-wal" "$d/config.toml"; do
+        # 0 字节的 WAL = 没有未落盘的内容，它的 mtime 只会被「打开过这个库」
+        # 这类无关操作碰新（判断脚本、备份工具……），不能当作会话活跃度。
+        case "$f" in
+            *-wal) [ -s "$f" ] || continue ;;
+        esac
+        t="$(stat -c %Y "$f" 2>/dev/null || true)"
+        [ -n "$t" ] || continue
+        [ "$t" -gt "$best" ] && best="$t"
+    done
+    if [ "$best" -eq 0 ]; then
+        t="$(find "$d/sessions" -type f -name 'rollout-*.jsonl' -printf '%T@\n' 2>/dev/null | sort -nr | head -1)"
+        [ -n "$t" ] && best="${t%%.*}"
+    fi
+    [ "$best" -eq 0 ] && best="$(stat -c %Y "$d" 2>/dev/null)"
+    printf '%s' "$best"
 }
 
 newest_dir_under() {
@@ -587,7 +617,7 @@ go_latest() {
 pick_recent() {
     # Menu over the most recent sessions (managed + legacy), merged and sorted
     # by real activity so the truly newest session is always entry #1.
-    local count="${1:-3}" i=0 sel=0 line kind act rest total=0
+    local count="${1:-10}" i=0 sel=0 line kind act rest total=0
     local -a kinds=() dirs=() homes=() sids=() labels=() subs=()
     local m_n=0 l_n=0 dir name model suffix start act_fmt title
     local home sid cwd first when
@@ -681,7 +711,7 @@ case "${1:-}" in
     list) list_providers ;;
     menu) choose_provider ;;
     go) shift; go_latest ;;
-    recent) shift; pick_recent "${1:-3}" ;;
+    recent) shift; pick_recent "${1:-10}" ;;
     update)
         shift
         update_mode=merge; update_target=''
