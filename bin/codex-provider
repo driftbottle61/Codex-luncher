@@ -743,7 +743,7 @@ Usage:
                                        # refresh model catalog (default: merge, keep local-only entries)
   codex-provider list
   codex-provider go               # auto-resume the single most recent session
-  codex-provider recent [N]       # pick from the N (default 3) most recent sessions
+  codex-provider recent [N]       # pick from the N (default 10) most recent sessions
   codex-provider use NAME [codex args...]
   codex-provider resume NAME [MODEL] [--last|--all|SESSION_ID]
 EOF

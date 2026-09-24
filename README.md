@@ -37,7 +37,7 @@ codex-provider          # interactive provider/model/session menu
 codex-provider setup    # add or update a provider
 codex-provider list     # list configured providers
 codex-provider go       # auto-resume the single most recent session
-codex-provider recent   # pick one of the 3 most recent sessions
+codex-provider recent   # pick one of the 10 most recent sessions
 codex-provider resume tokenhub --last
 codex-provider update tokenhub           # refresh that provider's model catalog
 codex-provider update all --replace      # refresh all, drop local-only entries
@@ -102,19 +102,21 @@ Do not add provider configs, session data, API keys, or Codex auth files.
 
 ## SSH session picker menu
 
-`codex-provider recent` lists the 3 most recently active sessions across
+`codex-provider recent` lists the 10 most recently active sessions across
 **all** providers/models *and legacy Codex homes* (timestamped, newest first,
 each with its first message as a hint) and resumes the one you pick:
 
 ```bash
-codex-provider recent     # pick one of the 3 most recent sessions
+codex-provider recent     # pick one of the 10 most recent sessions
 codex-provider recent 5   # show the 5 most recent sessions
 codex-provider go         # skip the menu, auto-resume the single latest
 ```
 
-"Recent" means the newest recorded session activity (rollout file mtime), not
-just directory age, so an idle but freshly started session cannot shadow your
-real last conversation. Sessions whose tmux is still running are attached
+"Recent" means the newest home-local session activity (`history.jsonl`,
+`state_5.sqlite`, a non-empty `state_5.sqlite-wal`, or `config.toml`), not just
+directory age or a rollout path pointing outside the home, so an idle but
+freshly started session cannot shadow your real last conversation. Sessions
+whose tmux is still running are attached
 directly. Legacy homes are ranked by the same activity clock and merged into
 the same list, so the truly newest session is always entry `#1` — even when it
 lives in an old plain-Codex home (`~/.codex`) rather than under a managed
