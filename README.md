@@ -38,8 +38,11 @@ codex-provider setup    # add a provider (same name = overwrite, no prompt)
 codex-provider edit NAME                       # edit a provider in place
 codex-provider edit NAME --set model=other     # non-interactive single change
 codex-provider edit NAME --set base_url=https://x/v1 --refresh
-codex-provider probe NAME                     # test every candidate model with a real minimal request
+codex-provider groups NAME                    # list the relay's groups (new-api /api/pricing)
+codex-provider groups NAME --group AZ         # the models a group is entitled to
+codex-provider probe NAME                     # test every candidate with a real minimal request
 codex-provider probe NAME --apply             # ...then rebuild the catalog with only the usable ones
+codex-provider probe NAME --group AZ --no-verify --apply   # just take the group catalog, no requests
 codex-provider probe NAME --model gpt-5.6-luna --keep gpt-image-2 --yes --apply
 codex-provider list     # list configured providers
 codex-provider go       # auto-resume the single most recent session
@@ -54,11 +57,22 @@ Provider data is stored under `${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}`.
 API keys are saved in mode `600` and exported only when a provider is started.
 Do not commit that directory or any API key files.
 
-`/v1/models` only advertises what a key's *group* is entitled to, and relays get
-both directions wrong: they list models with no channel behind them and omit
-models that do work. `probe NAME` settles it by sending one minimal request
-(`input=hi`, `max_output_tokens=16`) per candidate — the candidates being the
-local catalog plus the upstream list, or just `--model M` when given. A model
+Relays of the new-api family keep an authoritative per-group catalog at
+`/api/pricing` (the same data the web UI's pricing page uses): every model
+carries `enable_groups`. `codex-provider groups NAME` prints the groups and the
+model count, `--group G` prints that group's models. `probe` uses it as the
+candidate source: it derives the pricing URL from `base_url`, auto-detects which
+group the token belongs to (one deliberately impossible request — new-api
+answers `No available channel for model X under group AZ`, which is free because
+it always fails) and probes that group's models only. `--group G` overrides the
+detection, `--wide` falls back to the old "local catalog plus upstream
+`/models`" union, and `--model M` probes exactly what you name.
+
+`/v1/models` on the other hand is not trustworthy in either direction: it lists
+models with no channel behind them and omits models that do work. `probe` sends
+one minimal request (`input=hi`, `max_output_tokens=16`) per candidate, because
+being in the group catalog only means "entitled to", not "currently has a
+channel" — the difference is a 503 `No available channel` at call time. A model
 counts as usable only if the response is HTTP 200 *and* `status == completed`
 (chat providers need `choices`), so "listed but 503 / no channel" and "200 but
 the stream never completes" both show up as unusable. It costs a tiny amount of
@@ -69,7 +83,9 @@ limit.
 By default `probe` only reports. With `--apply` it rewrites `model-catalog.json`
 to the usable models, keeping the original catalog order, backing the old file
 up as `model-catalog.json.bak-before-probe-<YYYYmmdd-HHMMSS>`, and refusing to
-write an empty catalog. `--keep M` forces a model to stay even if it failed —
+write an empty catalog. `--no-verify` skips the requests altogether and applies
+the candidate list as-is — the way to write a group's whole catalog without
+spending anything, at the cost of keeping models that currently have no channel. `--keep M` forces a model to stay even if it failed —
 handy for image models, which cannot answer a `/responses` probe. Models the
 probe cannot judge this way are simply reported, never auto-added.
 

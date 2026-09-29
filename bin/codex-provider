@@ -366,17 +366,84 @@ edit_provider() {
     return 0
 }
 
+pricing_url() {
+    # new-api 类中转的目录接口：base_url 去掉尾部 /v1 再拼 /api/pricing
+    local b="${1%/}"; b="${b%/v1}"; printf '%s/api/pricing' "$b"
+}
+
+fetch_pricing() {
+    # $1=base_url $2=key（可空）。打印 /api/pricing 的 JSON；取不到返回 1
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -fsSL --max-time 30 -H "Authorization: Bearer ${2:-}" "$(pricing_url "$1")" 2>/dev/null
+}
+
+detect_group() {
+    # token 所属分组：用一个必然不存在的模型发一次请求，new-api 会在 503 里回
+    # "No available channel for model X under group AZ"。一定失败 ⇒ 不花额度。
+    local resp
+    resp="$(curl -s --max-time 30 -X POST "${1%/}/responses" \
+        -H "Authorization: Bearer ${2:-}" -H 'Content-Type: application/json' \
+        -d '{"model":"__codex_provider_group_probe__","input":"hi","max_output_tokens":16,"stream":false}' 2>/dev/null || true)"
+    printf '%s' "$resp" | sed -n 's/.*[Uu]nder group \([^ )]*\).*/\1/p' | head -1
+}
+
+groups_provider() {
+    # 列出中转的分组目录（new-api 的 /api/pricing → enable_groups），并标出本 token 的分组
+    local pname='' only_group=''
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --group) [ $# -ge 2 ] || die 'groups: --group needs a name'; only_group="$2"; shift 2 ;;
+            --group=*) only_group="${1#--group=}"; shift ;;
+            --*) die "groups: unknown option: $1" ;;
+            *) if [ -z "$pname" ]; then pname="$1"; else die "groups: unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -n "$pname" ] || die 'usage: codex-provider groups NAME [--group G]'
+    local dir; dir="$(provider_dir "$pname")"
+    [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
+    local name label base_url model wire_api key_env
+    unset name label base_url model wire_api key_env
+    . "$dir/provider.conf"
+    base_url="${base_url:-}"; key_env="${key_env:-}"
+    if [ -z "${!key_env:-}" ] && [ -f "$dir/api-key" ]; then export "$key_env=$(<"$dir/api-key")"; fi
+    local pricing
+    pricing="$(fetch_pricing "$base_url" "${!key_env:-}")" || pricing=''
+    printf '%s' "$pricing" | jq -e '.data' >/dev/null 2>&1 || die "groups: 取不到 $(pricing_url "$base_url") 的目录（该中转可能不是 new-api 型）"
+    if [ -n "$only_group" ]; then
+        local n
+        n="$(printf '%s' "$pricing" | jq -r --arg g "$only_group" '[.data[] | select((.enable_groups // []) | index($g))] | length')"
+        [ "$n" -gt 0 ] || die "groups: 没有分组 $only_group（先跑 codex-provider groups $pname 看全部）"
+        printf '分组 %s 的模型（%d 个）:\n' "$only_group" "$n"
+        printf '%s' "$pricing" | jq -r --arg g "$only_group" \
+            '.data[] | select((.enable_groups // []) | index($g)) | "  \(.model_name)\t\((.supported_endpoint_types // []) | join(","))"'
+        return 0
+    fi
+    local mine
+    mine="$(detect_group "$base_url" "${!key_env:-}")"
+    printf '所有分组（按模型数排序）:\n'
+    printf '%s' "$pricing" | jq -r '[.data[].enable_groups[]?] | group_by(.) | map({g: .[0], n: length}) | sort_by(-.n) | .[] | "  \(.n)\t\(.g)"'
+    if [ -n "$mine" ]; then
+        printf '\n本 token 所属分组: %s\n  看它的目录: codex-provider groups %s --group %s\n' "$mine" "$pname" "$mine"
+    else
+        printf '\n未能自动识别本 token 的分组；probe 时用 --group 指定。\n'
+    fi
+    return 0
+}
+
 probe_provider() {
-    # 用真实最小请求逐个探测模型到底能不能用。上游 /v1/models 只报「该 key 的广告位」：
-    # 分组/渠道受限时它会漏报（openmove 的 AZ 分组只列 5 个，但 gpt-5.6-luna 实测可调通），
-    # 也会误报（列出来但实际没有可用渠道）。只有真发一次请求才知道。
-    # 默认只报告不落盘，加 --apply 才按结果重建 model-catalog.json。
-    local pname='' apply=0 assume_yes=0 jobs=4 timeout=60
+    # 候选来源（优先级）：--model > --group > 自动识别的 token 分组 > 本地目录 ∪ 上游 /models。
+    # 前三者来自 new-api 的 /api/pricing（enable_groups 是权威的分组目录），
+    # 不用一个一个去猜；探测只是用来区分「目录里有」和「现在真有渠道」。
+    local pname='' apply=0 assume_yes=0 jobs=4 timeout=60 wide=0 no_verify=0 group=''
     local -a only=() keep=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --apply) apply=1; shift ;;
             --yes|-y) assume_yes=1; shift ;;
+            --wide) wide=1; shift ;;
+            --no-verify) no_verify=1; shift ;;
+            --group) [ $# -ge 2 ] || die 'probe: --group needs a name'; group="$2"; shift 2 ;;
+            --group=*) group="${1#--group=}"; shift ;;
             --jobs) [ $# -ge 2 ] || die 'probe: --jobs needs a number'; jobs="$2"; shift 2 ;;
             --jobs=*) jobs="${1#--jobs=}"; shift ;;
             --timeout) [ $# -ge 2 ] || die 'probe: --timeout needs seconds'; timeout="$2"; shift 2 ;;
@@ -389,7 +456,7 @@ probe_provider() {
             *) if [ -z "$pname" ]; then pname="$1"; else die "probe: unexpected argument: $1"; fi; shift ;;
         esac
     done
-    [ -n "$pname" ] || die 'usage: codex-provider probe NAME [--model M]... [--keep M]... [--apply] [--jobs N] [--timeout S] [--yes]'
+    [ -n "$pname" ] || die 'usage: codex-provider probe NAME [--group G] [--model M]... [--keep M]... [--apply] [--no-verify] [--wide] [--jobs N] [--timeout S] [--yes]'
     [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die 'probe: --jobs must be a positive integer'
     [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die 'probe: --timeout must be a positive integer'
     local dir; dir="$(provider_dir "$pname")"
@@ -404,42 +471,71 @@ probe_provider() {
     command -v curl >/dev/null 2>&1 || die 'curl is required to probe models'
     command -v jq >/dev/null 2>&1 || die 'jq is required to probe models'
 
-    # 候选 = --model 指定的；否则 本地目录 ∪ 上游 /v1/models（保持本地顺序，上游新增追加在后）
     local -a cands=()
-    local listf tmp m
+    local listf tmp m src=''
     if [ "${#only[@]}" -gt 0 ]; then
-        cands=("${only[@]}")
+        cands=("${only[@]}"); src='--model 指定'
     else
-        listf="$(mktemp)"; tmp="$(mktemp)"
-        if [ -f "$dir/model-catalog.json" ]; then
-            jq -r '.models[]? | (.slug // .id) | select(. != null)' "$dir/model-catalog.json" 2>/dev/null >> "$listf" || true
+        local pricing='' grp="$group"
+        if [ "$wide" != 1 ]; then
+            pricing="$(fetch_pricing "$base_url" "${!key_env:-}" || true)"
+            if printf '%s' "$pricing" | jq -e '.data' >/dev/null 2>&1; then
+                if [ -z "$grp" ]; then
+                    grp="$(detect_group "$base_url" "${!key_env:-}")"
+                    if [ -n "$grp" ]; then printf 'codex-provider: 检测到本 token 所属分组: %s\n' "$grp" >&2; fi
+                fi
+            else
+                pricing=''
+                if [ -n "$grp" ]; then printf 'codex-provider: 取不到 /api/pricing，--group 用不上\n' >&2; fi
+            fi
         fi
-        if curl -fsSL --max-time 30 -H "Authorization: Bearer ${!key_env}" "$base_url/models" -o "$tmp" 2>/dev/null; then
-            jq -r '(.data // .models // [])[] | (.id // .slug) | select(. != null)' "$tmp" 2>/dev/null >> "$listf" || true
-        else
-            printf 'codex-provider: 上游 /models 取不到，候选只用本地目录\n' >&2
+        if [ -n "$grp" ] && [ -n "$pricing" ]; then
+            mapfile -t cands < <(printf '%s' "$pricing" | jq -r --arg g "$grp" \
+                '.data[] | select((.enable_groups // []) | index($g)) | .model_name')
+            [ "${#cands[@]}" -gt 0 ] || die "probe: 分组 $grp 在 /api/pricing 里没有任何模型（用 codex-provider groups $pname 看全部分组）"
+            src="分组 $grp 的目录（/api/pricing）"
         fi
-        rm -f "$tmp"
-        [ -s "$listf" ] || printf '%s\n' "$model" >> "$listf"
-        mapfile -t cands < <(awk 'NF && !seen[$0]++' "$listf")
-        rm -f "$listf"
+        if [ "${#cands[@]}" -eq 0 ]; then
+            listf="$(mktemp)"; tmp="$(mktemp)"
+            if [ -f "$dir/model-catalog.json" ]; then
+                jq -r '.models[]? | (.slug // .id) | select(. != null)' "$dir/model-catalog.json" 2>/dev/null >> "$listf" || true
+            fi
+            if curl -fsSL --max-time 30 -H "Authorization: Bearer ${!key_env:-}" "$base_url/models" -o "$tmp" 2>/dev/null; then
+                jq -r '(.data // .models // [])[] | (.id // .slug) | select(. != null)' "$tmp" 2>/dev/null >> "$listf" || true
+            else
+                printf 'codex-provider: 上游 /models 取不到，候选只用本地目录\n' >&2
+            fi
+            rm -f "$tmp"
+            [ -s "$listf" ] || printf '%s\n' "$model" >> "$listf"
+            mapfile -t cands < <(awk 'NF && !seen[$0]++' "$listf")
+            rm -f "$listf"
+            src='本地目录 ∪ 上游 /models（没有分组信息，用 --group 可以只取某个分组）'
+        fi
     fi
     for m in "${cands[@]}"; do
         if [[ "$m" =~ [[:space:]] ]]; then die "probe: 模型 id 不能含空白字符: $m"; fi
     done
     [ "${#cands[@]}" -gt 0 ] || die 'probe: 没有候选模型'
+    printf '候选来源: %s\n' "$src"
 
-    local ans
-    printf '将探测 %s 的 %d 个模型（每个一次最小请求：input=hi / max_output_tokens=16）\n' "$pname" "${#cands[@]}"
-    if [ "$assume_yes" != 1 ]; then
-        [ -t 0 ] || die 'probe: 非交互调用请加 --yes（探测会产生极少量 API 费用）'
-        read -r -p '继续？[y/N] ' ans
-        case "$ans" in y|Y|yes|YES) ;; *) printf '已取消。\n'; return 0 ;; esac
-    fi
-
-    local helper outdir okf slot st code detail nok=0 nbad=0
+    local helper outdir okf slot st code detail ans nok=0 nbad=0
     helper="$(mktemp)"; outdir="$(mktemp -d)"; okf="$(mktemp)"
-    cat > "$helper" <<'HELPER'
+
+    if [ "$no_verify" = 1 ]; then
+        printf '采用 %d 个模型（--no-verify，不发探测请求、不花额度）:\n' "${#cands[@]}"
+        for m in "${cands[@]}"; do printf '  %s\n' "$m"; done
+        printf '%s\n' "${cands[@]}" > "$okf"
+        nok=${#cands[@]}
+        rmdir "$outdir" 2>/dev/null || rm -rf "$outdir"
+        rm -f "$helper"
+    else
+        printf '将探测 %s 的 %d 个模型（每个一次最小请求：input=hi / max_output_tokens=16）\n' "$pname" "${#cands[@]}"
+        if [ "$assume_yes" != 1 ]; then
+            [ -t 0 ] || die 'probe: 非交互调用请加 --yes（探测会产生极少量 API 费用）'
+            read -r -p '继续？[y/N] ' ans
+            case "$ans" in y|Y|yes|YES) ;; *) printf '已取消。\n'; return 0 ;; esac
+        fi
+        cat > "$helper" <<'HELPER'
 #!/usr/bin/env bash
 set -uo pipefail
 m="$1"
@@ -466,27 +562,28 @@ detail="$(jq -r '.error.message // empty' "$body" 2>/dev/null | tr '\n\r\t' '   
 printf '%s\t%s\t%s\n' "$ok" "$code" "$detail" > "$slot"
 rm -f "$body"
 HELPER
-    chmod 700 "$helper"
-    export WIRE="$wire_api" BASE="$base_url" KEY="${!key_env}" TIMEOUT="$timeout" OUTDIR="$outdir"
-    printf '%s\n' "${cands[@]}" | xargs -r -P "$jobs" -n 1 "$helper" || true
-    unset WIRE BASE KEY TIMEOUT OUTDIR
+        chmod 700 "$helper"
+        export WIRE="$wire_api" BASE="$base_url" KEY="${!key_env:-}" TIMEOUT="$timeout" OUTDIR="$outdir"
+        printf '%s\n' "${cands[@]}" | xargs -r -P "$jobs" -n 1 "$helper" || true
+        unset WIRE BASE KEY TIMEOUT OUTDIR
+        for m in "${cands[@]}"; do
+            slot="$outdir/$(printf '%s' "$m" | md5sum | cut -c1-32)"
+            if [ -f "$slot" ]; then IFS=$'\t' read -r st code detail < "$slot" || true; else st=false; code=000; detail='探测未返回结果'; fi
+            if [ "$st" = true ]; then
+                printf '  [可用] %-42s http=%s\n' "$m" "$code"
+                printf '%s\n' "$m" >> "$okf"
+                nok=$((nok + 1))
+            else
+                printf '  [不可用] %-40s http=%s %s\n' "$m" "$code" "$detail"
+                nbad=$((nbad + 1))
+            fi
+        done
+        rm -rf "$outdir" "$helper"
+        printf '\n可用 %d 个，不可用 %d 个\n' "$nok" "$nbad"
+    fi
 
-    for m in "${cands[@]}"; do
-        slot="$outdir/$(printf '%s' "$m" | md5sum | cut -c1-32)"
-        if [ -f "$slot" ]; then IFS=$'\t' read -r st code detail < "$slot" || true; else st=false; code=000; detail='探测未返回结果'; fi
-        if [ "$st" = true ]; then
-            printf '  [可用] %-42s http=%s\n' "$m" "$code"
-            printf '%s\n' "$m" >> "$okf"
-            nok=$((nok + 1))
-        else
-            printf '  [不可用] %-40s http=%s %s\n' "$m" "$code" "$detail"
-            nbad=$((nbad + 1))
-        fi
-    done
-    rm -rf "$outdir" "$helper"
-    printf '\n可用 %d 个，不可用 %d 个\n' "$nok" "$nbad"
     if [ "$apply" != 1 ]; then
-        printf '模型列表未改动；要按探测结果重建（只留可用的）就加 --apply 再跑一次。\n'
+        printf '模型列表未改动；要按上面这份结果重建就加 --apply。\n'
         rm -f "$okf"
         return 0
     fi
@@ -520,17 +617,17 @@ PY
 )" || { rm -f "$newcat" "$okf"; die 'probe: 生成新模型目录失败'; }
     if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -le 0 ]; then
         rm -f "$newcat" "$okf"
-        die 'probe: 没有探测到可用模型，保留原目录不动'
+        die 'probe: 结果为空，保留原目录不动'
     fi
     if [ -n "$model" ] && ! grep -qxF "$model" "$okf"; then
-        printf 'codex-provider: 提示: provider.conf 的默认模型 %s 本次探测没通过，建议改掉（codex-provider edit %s --set model=...）\n' "$model" "$pname" >&2
+        printf 'codex-provider: 提示: provider.conf 的默认模型 %s 不在这次的结果里，建议改掉（codex-provider edit %s --set model=...）\n' "$model" "$pname" >&2
     fi
     local bak="$dir/model-catalog.json.bak-before-probe-$(date +%Y%m%d-%H%M%S)"
     if [ -f "$dir/model-catalog.json" ]; then cp -a "$dir/model-catalog.json" "$bak"; fi
     chmod 600 "$newcat"
     mv -f "$newcat" "$dir/model-catalog.json"
     rm -f "$okf"
-    printf '模型列表已按探测结果重建: %s 项（%s）\n' "$n" "$dir/model-catalog.json"
+    printf '模型列表已重建: %s 项（%s）\n' "$n" "$dir/model-catalog.json"
     if [ -f "$bak" ]; then printf '旧目录备份: %s（要回退直接覆盖回去即可）\n' "${bak##*/}"; fi
     ensure_codex_catalog "$dir" >/dev/null 2>&1 || true
     return 0
@@ -1019,6 +1116,7 @@ case "${1:-}" in
     setup) setup_provider ;;
     edit) shift; edit_provider "$@" ;;
     probe) shift; probe_provider "$@" ;;
+    groups) shift; groups_provider "$@" ;;
     list) list_providers ;;
     menu) choose_provider ;;
     go) shift; go_latest ;;
@@ -1056,10 +1154,14 @@ Usage:
                                        # edit an existing provider; empty answer keeps
                                        # the current value. --set is non-interactive
                                        # (fields: label base_url model wire_api key_env key)
-  codex-provider probe NAME [--model M]... [--keep M]... [--apply]
-                                       # test each model with a minimal real request
-                                       # (upstream /models lies when a group/key is
-                                       # restricted); --apply rewrites the catalog
+  codex-provider groups NAME [--group G]
+                                       # list the relay's groups (new-api /api/pricing)
+  codex-provider probe NAME [--group G] [--model M]... [--keep M]...
+                           [--apply] [--no-verify] [--wide] [--jobs N]
+                                       # candidates come from the token's group catalog
+                                       # (/api/pricing enable_groups, auto-detected);
+                                       # each is tested with a minimal real request
+                                       # --no-verify skips the requests, --apply writes
   codex-provider list
   codex-provider go               # auto-resume the single most recent session
   codex-provider recent [N]       # pick from the N (default 10) most recent sessions
