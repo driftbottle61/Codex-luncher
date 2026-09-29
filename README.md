@@ -97,10 +97,22 @@ actually call, e.g. `gpt-5.6-luna` on openmove). It now copies the previous
 catalog to `model-catalog.json.bak-before-replace-<YYYYmmdd-HHMMSS>` and lists the
 entries it drops, so a mistake is recoverable.
 
+A provider may pin a relay `group` (`group=AZ` in `provider.conf`, asked for by
+`setup`, editable with `codex-provider edit NAME` / `--set group=AZ`, shown by
+`list`). When a group is pinned — or auto-detected — `update NAME`, the menu's
+refresh and the pre-session refresh all take the model list from that group's
+catalog in `/api/pricing` instead of `/v1/models`, so models belonging to other
+groups never leak into the picker. Without a group, and if `/api/pricing` is
+missing, it falls back to `/v1/models` and says so. Note the merge rule still
+applies: a refresh keeps local entries and appends the group's, so running
+`probe --apply` to narrow the catalog to what currently works is undone by the
+next refresh (the group catalog is the entitlement list, not the live one).
+
 `edit` shows the current value as the prompt default and keeps it if you just
 press Enter, so you can change one field without retyping the rest; the API key
 prompt is hidden and an empty answer leaves the saved key alone. Editable
-fields are `label`, `base_url`, `model`, `wire_api`, `key_env` and `key`
+fields are `label`, `base_url`, `group`, `model`, `wire_api`, `key_env` and
+`key`
 (`--set key=...` rotates the key). The provider `name` is its directory and is
 not editable. Every change first copies `provider.conf` to
 `provider.conf.bak-before-edit-<YYYYmmdd-HHMMSS>` (and `api-key` likewise when

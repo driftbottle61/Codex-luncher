@@ -19,20 +19,39 @@ update_provider_models() {
     # $2 = merge（默认，保留本地已有条目，上游新增的追加在后）/ replace（纯上游列表）
     # name/label/... 必须声明为 local：本函数会重新 source provider.conf，
     # 否则会把调用方（run_provider）刚算好的 $model 覆盖成 provider 的默认模型。
-    local pname="$1" mode="${2:-merge}" dir keyvar tmp merged oldjson kept dropped catbak
-    local name label base_url model wire_api key_env
+    local pname="$1" mode="${2:-merge}" dir keyvar tmp merged oldjson kept dropped catbak src
+    local name label base_url model wire_api key_env group
     dir="$(provider_dir "$pname")"
     [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
-    unset name label base_url model wire_api key_env
+    unset name label base_url model wire_api key_env group
     . "$dir/provider.conf"
     keyvar="$key_env"
+    group="${group:-}"
     if [ -z "${!keyvar:-}" ] && [ -f "$dir/api-key" ]; then export "$keyvar=$(<"$dir/api-key")"; fi
     [ -n "${!keyvar:-}" ] || die "environment variable $keyvar is not set and no saved key exists"
     command -v curl >/dev/null 2>&1 || die 'curl is required to update models'
     command -v jq >/dev/null 2>&1 || die 'jq is required to update models'
     tmp="$(mktemp)"; merged="$(mktemp)"
-    if ! curl -fsSL --max-time 30 -H "Authorization: Bearer ${!keyvar}" "$base_url/models" -o "$tmp"; then
-        rm -f "$tmp" "$merged"; return 1
+    # 目录来源：优先 new-api 的「分组目录」（/api/pricing 的 enable_groups）。
+    # provider.conf 里写了 group= 就用它，没写就自动识别（一次必然失败的请求，不花钱）。
+    # /v1/models 只在拿不到分组目录时兜底 —— 它会把别组的模型也报出来。
+    src=''
+    local ggroup="$group" pricing=''
+    if [ -z "$ggroup" ]; then ggroup="$(detect_group "$base_url" "${!keyvar:-}" || true)"; fi
+    if [ -n "$ggroup" ]; then
+        pricing="$(fetch_pricing "$base_url" "${!keyvar:-}" || true)"
+        if printf '%s' "$pricing" | jq -e --arg g "$ggroup" \
+             '[.data[] | select((.enable_groups // []) | index($g))] | length > 0' >/dev/null 2>&1; then
+            printf '%s' "$pricing" | jq -c --arg g "$ggroup" \
+                '{data: [.data[] | select((.enable_groups // []) | index($g)) | {id: .model_name, name: .model_name}]}' > "$tmp"
+            src="分组 $ggroup 的目录（/api/pricing）"
+        fi
+    fi
+    if [ -z "$src" ]; then
+        if ! curl -fsSL --max-time 30 -H "Authorization: Bearer ${!keyvar}" "$base_url/models" -o "$tmp"; then
+            rm -f "$tmp" "$merged"; return 1
+        fi
+        src='上游 /models'
     fi
     # 合并策略：本地条目按原顺序在前（手工挑选/自建的模型不会被一次刷新抹掉），
     # 上游返回而本地没有的追加在后面。本地目录缺失或损坏则退回纯上游列表。
@@ -73,7 +92,7 @@ update_provider_models() {
         return 1
     fi
     chmod 600 "$merged"; mv -f "$merged" "$dir/model-catalog.json"; rm -f "$tmp"
-    printf 'Updated model catalog: %s\n' "$dir/model-catalog.json"
+    printf 'Updated model catalog: %s（来源: %s）\n' "$dir/model-catalog.json" "$src"
     if [ -n "$kept" ]; then
         printf 'codex-provider: 上游未返回但已保留本地条目: %s（要清掉请用 update %s --replace）\n' "$kept" "$pname" >&2
     fi
@@ -212,7 +231,7 @@ PY
 }
 
 setup_provider() {
-    local name label base model wire keyvar key catalog dir
+    local name label base model wire keyvar key catalog group dir
     read -r -p 'Provider name: ' name
     valid_name "$name" || die 'invalid provider name'
     dir="$(provider_dir "$name")"
@@ -222,6 +241,7 @@ setup_provider() {
     read -r -p 'Model: ' model; [ -n "$model" ] || die 'model is required'
     read -r -p 'Wire API [responses]: ' wire; wire="${wire:-responses}"
     read -r -p 'Model catalog JSON path or URL (optional): ' catalog
+    read -r -p 'Relay group (optional, e.g. AZ; Enter = auto-detect): ' group
     read -r -p 'API key environment variable [OPENAI_API_KEY]: ' keyvar; keyvar="${keyvar:-OPENAI_API_KEY}"
     [[ "$keyvar" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die 'invalid environment variable name'
     read -r -s -p 'API key (hidden input): ' key; printf '\n'
@@ -234,6 +254,7 @@ base_url=$(conf_value "$base")
 model=$(conf_value "$model")
 wire_api=$(conf_value "$wire")
 key_env=$(conf_value "$keyvar")
+group=$(conf_value "$group")
 EOF
     chmod 600 "$dir/provider.conf"
     printf '%s\n' "$key" > "$dir/api-key"
@@ -267,14 +288,14 @@ edit_provider() {
     [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
 
     # 读当前值作默认值（provider.conf 不含密钥，key 单独放 api-key）
-    local name label base_url model wire_api key_env
-    unset name label base_url model wire_api key_env
+    local name label base_url model wire_api key_env group
+    unset name label base_url model wire_api key_env group
     . "$dir/provider.conf"
     label="${label:-}"; base_url="${base_url:-}"; model="${model:-}"
-    wire_api="${wire_api:-}"; key_env="${key_env:-}"
+    wire_api="${wire_api:-}"; key_env="${key_env:-}"; group="${group:-}"
 
     local new_label="$label" new_base="$base_url" new_model="$model"
-    local new_wire="$wire_api" new_keyenv="$key_env" new_key='' key_changed=0
+    local new_wire="$wire_api" new_keyenv="$key_env" new_group="$group" new_key='' key_changed=0
     local kv f v ans
     if [ "${#sets[@]}" -gt 0 ]; then
         for kv in "${sets[@]}"; do
@@ -283,11 +304,12 @@ edit_provider() {
             case "$f" in
                 label) new_label="$v" ;;
                 base_url|base-url|baseurl) new_base="$v" ;;
+                group) new_group="$v" ;;
                 model) new_model="$v" ;;
                 wire_api|wire-api|wire) new_wire="$v" ;;
                 key_env|key-env|keyenv) new_keyenv="$v" ;;
                 key|api_key|api-key) new_key="$v"; key_changed=1 ;;
-                *) die "edit: unknown field: $f (label|base_url|model|wire_api|key_env|key)" ;;
+                *) die "edit: unknown field: $f (label|base_url|group|model|wire_api|key_env|key)" ;;
             esac
         done
     fi
@@ -298,6 +320,7 @@ edit_provider() {
         read -r -p "Display name [$new_label]: " ans; new_label="${ans:-$new_label}"
         read -r -p "API base URL [$new_base]: " ans; new_base="${ans:-$new_base}"
         read -r -p "Model [$new_model]: " ans; new_model="${ans:-$new_model}"
+        read -r -p "Relay group (empty = 自动识别) [$new_group]: " ans; new_group="${ans:-$new_group}"
         read -r -p "Wire API [$new_wire]: " ans; new_wire="${ans:-$new_wire}"
         read -r -p "API key environment variable [$new_keyenv]: " ans; new_keyenv="${ans:-$new_keyenv}"
         read -r -s -p 'API key (留空 = 不修改): ' ans; printf '\n'
@@ -315,7 +338,8 @@ edit_provider() {
     if [ "$key_changed" = 1 ] && [ -z "$new_key" ]; then die 'edit: API key 不能为空'; fi
 
     if [ "$new_label" = "$label" ] && [ "$new_base" = "$base_url" ] && [ "$new_model" = "$model" ] \
-       && [ "$new_wire" = "$wire_api" ] && [ "$new_keyenv" = "$key_env" ] && [ "$key_changed" = 0 ]; then
+       && [ "$new_wire" = "$wire_api" ] && [ "$new_keyenv" = "$key_env" ] && [ "$new_group" = "$group" ] \
+       && [ "$key_changed" = 0 ]; then
         printf '%s: 未做任何修改。\n' "$pname"
         return 0
     fi
@@ -332,6 +356,7 @@ edit_provider() {
             model=*) printf 'model=%s\n' "$(conf_value "$new_model")" >> "$tmp"; seen="$seen model" ;;
             wire_api=*) printf 'wire_api=%s\n' "$(conf_value "$new_wire")" >> "$tmp"; seen="$seen wire_api" ;;
             key_env=*) printf 'key_env=%s\n' "$(conf_value "$new_keyenv")" >> "$tmp"; seen="$seen key_env" ;;
+            group=*) printf 'group=%s\n' "$(conf_value "$new_group")" >> "$tmp"; seen="$seen group" ;;
             *) printf '%s\n' "$line" >> "$tmp" ;;
         esac
     done < "$dir/provider.conf"
@@ -340,6 +365,7 @@ edit_provider() {
     case " $seen " in *' model '*) ;; *) printf 'model=%s\n' "$(conf_value "$new_model")" >> "$tmp" ;; esac
     case " $seen " in *' wire_api '*) ;; *) printf 'wire_api=%s\n' "$(conf_value "$new_wire")" >> "$tmp" ;; esac
     case " $seen " in *' key_env '*) ;; *) printf 'key_env=%s\n' "$(conf_value "$new_keyenv")" >> "$tmp" ;; esac
+    case " $seen " in *' group '*) ;; *) printf 'group=%s\n' "$(conf_value "$new_group")" >> "$tmp" ;; esac
     grep -q '^name=' "$tmp" || printf 'name=%s\n' "$(conf_value "$pname")" >> "$tmp"
     chmod 600 "$tmp"
     mv -f "$tmp" "$dir/provider.conf"
@@ -354,8 +380,8 @@ edit_provider() {
     printf '\n--- diff (备份 %s) ---\n' "${backup##*/}"
     diff -u --label "${backup##*/}" --label 'provider.conf (new)' "$backup" "$dir/provider.conf" || true
     printf '\n%s 现在的配置：\n' "$pname"
-    printf '  label=%s\n  base_url=%s\n  model=%s\n  wire_api=%s\n  key_env=%s\n' \
-        "$new_label" "$new_base" "$new_model" "$new_wire" "$new_keyenv"
+    printf '  label=%s\n  base_url=%s\n  group=%s\n  model=%s\n  wire_api=%s\n  key_env=%s\n' \
+        "$new_label" "$new_base" "${new_group:-（未设置，自动识别）}" "$new_model" "$new_wire" "$new_keyenv"
 
     if [ "$do_refresh" = 1 ]; then
         printf '\n刷新模型列表...\n'
@@ -461,9 +487,10 @@ probe_provider() {
     [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die 'probe: --timeout must be a positive integer'
     local dir; dir="$(provider_dir "$pname")"
     [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
-    local name label base_url model wire_api key_env
-    unset name label base_url model wire_api key_env
+    local name label base_url model wire_api key_env group_conf opt_group="$group"
+    unset name label base_url model wire_api key_env group_conf
     . "$dir/provider.conf"
+    group_conf="${group:-}"; group="$opt_group"
     base_url="${base_url:-}"; model="${model:-}"; wire_api="${wire_api:-responses}"; key_env="${key_env:-}"
     [ -n "$base_url" ] || die 'probe: provider.conf 里没有 base_url'
     if [ -z "${!key_env:-}" ] && [ -f "$dir/api-key" ]; then export "$key_env=$(<"$dir/api-key")"; fi
@@ -476,7 +503,7 @@ probe_provider() {
     if [ "${#only[@]}" -gt 0 ]; then
         cands=("${only[@]}"); src='--model 指定'
     else
-        local pricing='' grp="$group"
+        local pricing='' grp="${group:-$group_conf}"
         if [ "$wide" != 1 ]; then
             pricing="$(fetch_pricing "$base_url" "${!key_env:-}" || true)"
             if printf '%s' "$pricing" | jq -e '.data' >/dev/null 2>&1; then
@@ -509,7 +536,7 @@ probe_provider() {
             [ -s "$listf" ] || printf '%s\n' "$model" >> "$listf"
             mapfile -t cands < <(awk 'NF && !seen[$0]++' "$listf")
             rm -f "$listf"
-            src='本地目录 ∪ 上游 /models（没有分组信息，用 --group 可以只取某个分组）'
+            src='本地目录 ∪ 上游 /models（没有分组信息；用 --group 或 provider.conf 的 group= 可以只取某个分组）'
         fi
     fi
     for m in "${cands[@]}"; do
@@ -636,11 +663,11 @@ PY
 list_providers() {
     [ -d "$ROOT" ] || { echo 'No providers configured.'; return; }
     for dir in "$ROOT"/*; do
-        local name label base_url model wire_api key_env
+        local name label base_url model wire_api key_env group
         [ -f "$dir/provider.conf" ] || continue
-        unset name label base_url model wire_api key_env
+        unset name label base_url model wire_api key_env group
         . "$dir/provider.conf"
-        printf '%-18s model=%-28s key=%s sessions=%s\n' "$name" "$model" "$key_env" "$dir/sessions"
+        printf '%-18s model=%-28s key=%s sessions=%s%s\n' "$name" "$model" "$key_env" "$dir/sessions" "${group:+ group=$group}"
     done
 }
 
@@ -1153,7 +1180,7 @@ Usage:
   codex-provider edit NAME [--set field=value]... [--refresh]
                                        # edit an existing provider; empty answer keeps
                                        # the current value. --set is non-interactive
-                                       # (fields: label base_url model wire_api key_env key)
+                                       # (fields: label base_url group model wire_api key_env key)
   codex-provider groups NAME [--group G]
                                        # list the relay's groups (new-api /api/pricing)
   codex-provider probe NAME [--group G] [--model M]... [--keep M]...
