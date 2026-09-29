@@ -366,6 +366,176 @@ edit_provider() {
     return 0
 }
 
+probe_provider() {
+    # 用真实最小请求逐个探测模型到底能不能用。上游 /v1/models 只报「该 key 的广告位」：
+    # 分组/渠道受限时它会漏报（openmove 的 AZ 分组只列 5 个，但 gpt-5.6-luna 实测可调通），
+    # 也会误报（列出来但实际没有可用渠道）。只有真发一次请求才知道。
+    # 默认只报告不落盘，加 --apply 才按结果重建 model-catalog.json。
+    local pname='' apply=0 assume_yes=0 jobs=4 timeout=60
+    local -a only=() keep=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --apply) apply=1; shift ;;
+            --yes|-y) assume_yes=1; shift ;;
+            --jobs) [ $# -ge 2 ] || die 'probe: --jobs needs a number'; jobs="$2"; shift 2 ;;
+            --jobs=*) jobs="${1#--jobs=}"; shift ;;
+            --timeout) [ $# -ge 2 ] || die 'probe: --timeout needs seconds'; timeout="$2"; shift 2 ;;
+            --timeout=*) timeout="${1#--timeout=}"; shift ;;
+            --model) [ $# -ge 2 ] || die 'probe: --model needs an id'; only+=("$2"); shift 2 ;;
+            --model=*) only+=("${1#--model=}"); shift ;;
+            --keep) [ $# -ge 2 ] || die 'probe: --keep needs an id'; keep+=("$2"); shift 2 ;;
+            --keep=*) keep+=("${1#--keep=}"); shift ;;
+            --*) die "probe: unknown option: $1" ;;
+            *) if [ -z "$pname" ]; then pname="$1"; else die "probe: unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -n "$pname" ] || die 'usage: codex-provider probe NAME [--model M]... [--keep M]... [--apply] [--jobs N] [--timeout S] [--yes]'
+    [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || die 'probe: --jobs must be a positive integer'
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die 'probe: --timeout must be a positive integer'
+    local dir; dir="$(provider_dir "$pname")"
+    [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
+    local name label base_url model wire_api key_env
+    unset name label base_url model wire_api key_env
+    . "$dir/provider.conf"
+    base_url="${base_url:-}"; model="${model:-}"; wire_api="${wire_api:-responses}"; key_env="${key_env:-}"
+    [ -n "$base_url" ] || die 'probe: provider.conf 里没有 base_url'
+    if [ -z "${!key_env:-}" ] && [ -f "$dir/api-key" ]; then export "$key_env=$(<"$dir/api-key")"; fi
+    [ -n "${!key_env:-}" ] || die "environment variable $key_env is not set and no saved key exists"
+    command -v curl >/dev/null 2>&1 || die 'curl is required to probe models'
+    command -v jq >/dev/null 2>&1 || die 'jq is required to probe models'
+
+    # 候选 = --model 指定的；否则 本地目录 ∪ 上游 /v1/models（保持本地顺序，上游新增追加在后）
+    local -a cands=()
+    local listf tmp m
+    if [ "${#only[@]}" -gt 0 ]; then
+        cands=("${only[@]}")
+    else
+        listf="$(mktemp)"; tmp="$(mktemp)"
+        if [ -f "$dir/model-catalog.json" ]; then
+            jq -r '.models[]? | (.slug // .id) | select(. != null)' "$dir/model-catalog.json" 2>/dev/null >> "$listf" || true
+        fi
+        if curl -fsSL --max-time 30 -H "Authorization: Bearer ${!key_env}" "$base_url/models" -o "$tmp" 2>/dev/null; then
+            jq -r '(.data // .models // [])[] | (.id // .slug) | select(. != null)' "$tmp" 2>/dev/null >> "$listf" || true
+        else
+            printf 'codex-provider: 上游 /models 取不到，候选只用本地目录\n' >&2
+        fi
+        rm -f "$tmp"
+        [ -s "$listf" ] || printf '%s\n' "$model" >> "$listf"
+        mapfile -t cands < <(awk 'NF && !seen[$0]++' "$listf")
+        rm -f "$listf"
+    fi
+    for m in "${cands[@]}"; do
+        if [[ "$m" =~ [[:space:]] ]]; then die "probe: 模型 id 不能含空白字符: $m"; fi
+    done
+    [ "${#cands[@]}" -gt 0 ] || die 'probe: 没有候选模型'
+
+    local ans
+    printf '将探测 %s 的 %d 个模型（每个一次最小请求：input=hi / max_output_tokens=16）\n' "$pname" "${#cands[@]}"
+    if [ "$assume_yes" != 1 ]; then
+        [ -t 0 ] || die 'probe: 非交互调用请加 --yes（探测会产生极少量 API 费用）'
+        read -r -p '继续？[y/N] ' ans
+        case "$ans" in y|Y|yes|YES) ;; *) printf '已取消。\n'; return 0 ;; esac
+    fi
+
+    local helper outdir okf slot st code detail nok=0 nbad=0
+    helper="$(mktemp)"; outdir="$(mktemp -d)"; okf="$(mktemp)"
+    cat > "$helper" <<'HELPER'
+#!/usr/bin/env bash
+set -uo pipefail
+m="$1"
+slot="$OUTDIR/$(printf '%s' "$m" | md5sum | cut -c1-32)"
+body="$(mktemp)"
+if [ "$WIRE" = chat ]; then
+    url="$BASE/chat/completions"
+    payload="$(printf '{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"stream":false}' "$m")"
+else
+    url="$BASE/responses"
+    payload="$(printf '{"model":"%s","input":"hi","max_output_tokens":16,"stream":false}' "$m")"
+fi
+code="$(curl -s -o "$body" -w '%{http_code}' --max-time "$TIMEOUT" -X POST "$url" \
+        -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$payload" 2>/dev/null)" || code=000
+ok=false
+if [ "$code" = 200 ]; then
+    if [ "$WIRE" = chat ]; then
+        if [ "$(jq -r 'has("choices") and (.error == null)' "$body" 2>/dev/null)" = true ]; then ok=true; fi
+    else
+        if [ "$(jq -r '(.status // "completed") == "completed" and (.error == null)' "$body" 2>/dev/null)" = true ]; then ok=true; fi
+    fi
+fi
+detail="$(jq -r '.error.message // empty' "$body" 2>/dev/null | tr '\n\r\t' '   ' | cut -c1-100)"
+printf '%s\t%s\t%s\n' "$ok" "$code" "$detail" > "$slot"
+rm -f "$body"
+HELPER
+    chmod 700 "$helper"
+    export WIRE="$wire_api" BASE="$base_url" KEY="${!key_env}" TIMEOUT="$timeout" OUTDIR="$outdir"
+    printf '%s\n' "${cands[@]}" | xargs -r -P "$jobs" -n 1 "$helper" || true
+    unset WIRE BASE KEY TIMEOUT OUTDIR
+
+    for m in "${cands[@]}"; do
+        slot="$outdir/$(printf '%s' "$m" | md5sum | cut -c1-32)"
+        if [ -f "$slot" ]; then IFS=$'\t' read -r st code detail < "$slot" || true; else st=false; code=000; detail='探测未返回结果'; fi
+        if [ "$st" = true ]; then
+            printf '  [可用] %-42s http=%s\n' "$m" "$code"
+            printf '%s\n' "$m" >> "$okf"
+            nok=$((nok + 1))
+        else
+            printf '  [不可用] %-40s http=%s %s\n' "$m" "$code" "$detail"
+            nbad=$((nbad + 1))
+        fi
+    done
+    rm -rf "$outdir" "$helper"
+    printf '\n可用 %d 个，不可用 %d 个\n' "$nok" "$nbad"
+    if [ "$apply" != 1 ]; then
+        printf '模型列表未改动；要按探测结果重建（只留可用的）就加 --apply 再跑一次。\n'
+        rm -f "$okf"
+        return 0
+    fi
+    local k
+    for k in ${keep[@]+"${keep[@]}"}; do printf '%s\n' "$k" >> "$okf"; done
+    local newcat n
+    newcat="$(mktemp)"
+    n="$(python3 - "$dir/model-catalog.json" "$okf" "$newcat" <<'PY'
+import json, os, sys
+cat_path, ok_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+ok = [l.strip() for l in open(ok_path, encoding="utf-8") if l.strip()]
+seen = set(ok)
+order = []
+if os.path.exists(cat_path):
+    try:
+        for item in json.load(open(cat_path, encoding="utf-8")).get("models", []):
+            value = item.get("slug") or item.get("id")
+            if value and value in seen and value not in order:
+                order.append(value)
+    except Exception:
+        pass
+for value in ok:
+    if value not in order:
+        order.append(value)
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump({"models": [{"slug": i, "id": i, "display_name": i} for i in order]},
+              f, indent=2, ensure_ascii=False)
+os.chmod(out_path, 0o600)
+print(len(order))
+PY
+)" || { rm -f "$newcat" "$okf"; die 'probe: 生成新模型目录失败'; }
+    if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -le 0 ]; then
+        rm -f "$newcat" "$okf"
+        die 'probe: 没有探测到可用模型，保留原目录不动'
+    fi
+    if [ -n "$model" ] && ! grep -qxF "$model" "$okf"; then
+        printf 'codex-provider: 提示: provider.conf 的默认模型 %s 本次探测没通过，建议改掉（codex-provider edit %s --set model=...）\n' "$model" "$pname" >&2
+    fi
+    local bak="$dir/model-catalog.json.bak-before-probe-$(date +%Y%m%d-%H%M%S)"
+    if [ -f "$dir/model-catalog.json" ]; then cp -a "$dir/model-catalog.json" "$bak"; fi
+    chmod 600 "$newcat"
+    mv -f "$newcat" "$dir/model-catalog.json"
+    rm -f "$okf"
+    printf '模型列表已按探测结果重建: %s 项（%s）\n' "$n" "$dir/model-catalog.json"
+    if [ -f "$bak" ]; then printf '旧目录备份: %s（要回退直接覆盖回去即可）\n' "${bak##*/}"; fi
+    ensure_codex_catalog "$dir" >/dev/null 2>&1 || true
+    return 0
+}
+
 list_providers() {
     [ -d "$ROOT" ] || { echo 'No providers configured.'; return; }
     for dir in "$ROOT"/*; do
@@ -848,6 +1018,7 @@ case "${1:-}" in
     '') choose_provider ;;
     setup) setup_provider ;;
     edit) shift; edit_provider "$@" ;;
+    probe) shift; probe_provider "$@" ;;
     list) list_providers ;;
     menu) choose_provider ;;
     go) shift; go_latest ;;
@@ -885,6 +1056,10 @@ Usage:
                                        # edit an existing provider; empty answer keeps
                                        # the current value. --set is non-interactive
                                        # (fields: label base_url model wire_api key_env key)
+  codex-provider probe NAME [--model M]... [--keep M]... [--apply]
+                                       # test each model with a minimal real request
+                                       # (upstream /models lies when a group/key is
+                                       # restricted); --apply rewrites the catalog
   codex-provider list
   codex-provider go               # auto-resume the single most recent session
   codex-provider recent [N]       # pick from the N (default 10) most recent sessions

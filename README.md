@@ -38,6 +38,9 @@ codex-provider setup    # add a provider (same name = overwrite, no prompt)
 codex-provider edit NAME                       # edit a provider in place
 codex-provider edit NAME --set model=other     # non-interactive single change
 codex-provider edit NAME --set base_url=https://x/v1 --refresh
+codex-provider probe NAME                     # test every candidate model with a real minimal request
+codex-provider probe NAME --apply             # ...then rebuild the catalog with only the usable ones
+codex-provider probe NAME --model gpt-5.6-luna --keep gpt-image-2 --yes --apply
 codex-provider list     # list configured providers
 codex-provider go       # auto-resume the single most recent session
 codex-provider recent   # pick one of the 10 most recent sessions
@@ -50,6 +53,25 @@ codex-provider update all --replace      # refresh all, drop local-only entries
 Provider data is stored under `${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}`.
 API keys are saved in mode `600` and exported only when a provider is started.
 Do not commit that directory or any API key files.
+
+`/v1/models` only advertises what a key's *group* is entitled to, and relays get
+both directions wrong: they list models with no channel behind them and omit
+models that do work. `probe NAME` settles it by sending one minimal request
+(`input=hi`, `max_output_tokens=16`) per candidate — the candidates being the
+local catalog plus the upstream list, or just `--model M` when given. A model
+counts as usable only if the response is HTTP 200 *and* `status == completed`
+(chat providers need `choices`), so "listed but 503 / no channel" and "200 but
+the stream never completes" both show up as unusable. It costs a tiny amount of
+credit per model, so it asks for confirmation unless `--yes`; `--jobs N`
+(default 4) sets the parallelism and `--timeout S` (default 60) the per-request
+limit.
+
+By default `probe` only reports. With `--apply` it rewrites `model-catalog.json`
+to the usable models, keeping the original catalog order, backing the old file
+up as `model-catalog.json.bak-before-probe-<YYYYmmdd-HHMMSS>`, and refusing to
+write an empty catalog. `--keep M` forces a model to stay even if it failed —
+handy for image models, which cannot answer a `/responses` probe. Models the
+probe cannot judge this way are simply reported, never auto-added.
 
 `update NAME` merges by default: entries already in the local catalog keep their
 place and the upstream list is appended, so hand-picked models survive a refresh.
