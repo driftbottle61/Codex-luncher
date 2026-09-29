@@ -19,7 +19,7 @@ update_provider_models() {
     # $2 = merge（默认，保留本地已有条目，上游新增的追加在后）/ replace（纯上游列表）
     # name/label/... 必须声明为 local：本函数会重新 source provider.conf，
     # 否则会把调用方（run_provider）刚算好的 $model 覆盖成 provider 的默认模型。
-    local pname="$1" mode="${2:-merge}" dir keyvar tmp merged oldjson kept
+    local pname="$1" mode="${2:-merge}" dir keyvar tmp merged oldjson kept dropped catbak
     local name label base_url model wire_api key_env
     dir="$(provider_dir "$pname")"
     [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
@@ -48,13 +48,23 @@ update_provider_models() {
         ' "$tmp" > "$merged" 2>/dev/null; then
         jq -e '{models: [(.data // .models // [])[] | (.id // .slug) as $id | select($id != null) | {slug:$id,id:$id,display_name:(.name // $id)}]}' "$tmp" > "$merged" || { rm -f "$tmp" "$merged"; return 1; }
     fi
-    # 上游这次没返回、但本地原有的条目（= 本次被保留下来的），提示一下
-    kept=''
-    if [ "$mode" != replace ]; then
-        kept="$(jq -r --argjson old "$oldjson" '
+    # 上游本次没返回、但本地原有的条目：merge 会保留（提示一下），
+    # replace 会丢弃（先备份目录，再把丢掉的列出来）——否则 `update NAME --replace`
+    # 会静默清光手工挑选的模型（例如上游清单里不返回但实测可用的 gpt-5.6-luna）。
+    kept=''; dropped=''; catbak=''
+    if [ -f "$dir/model-catalog.json" ]; then
+        dropped="$(jq -r --argjson old "$(<"$dir/model-catalog.json")" '
               [(.data // .models // [])[] | (.id // .slug) | select(. != null)] as $n
               | [($old.models // [])[].id | select(. as $i | ($n | index($i)) == null)] | join(", ")
             ' "$tmp" 2>/dev/null || true)"
+    fi
+    if [ "$mode" = replace ]; then
+        if [ -f "$dir/model-catalog.json" ]; then
+            catbak="$dir/model-catalog.json.bak-before-replace-$(date +%Y%m%d-%H%M%S)"
+            cp -a "$dir/model-catalog.json" "$catbak"
+        fi
+    else
+        kept="$dropped"; dropped=''
     fi
     # 兜底：空目录会让 codex 直接启动失败（model_catalog_json must contain at least one model）
     if ! jq -e '.models | length > 0' "$merged" >/dev/null 2>&1; then
@@ -66,6 +76,12 @@ update_provider_models() {
     printf 'Updated model catalog: %s\n' "$dir/model-catalog.json"
     if [ -n "$kept" ]; then
         printf 'codex-provider: 上游未返回但已保留本地条目: %s（要清掉请用 update %s --replace）\n' "$kept" "$pname" >&2
+    fi
+    if [ "$mode" = replace ] && [ -n "$dropped" ]; then
+        printf 'codex-provider: 警告: --replace 丢弃了上游未返回的本地条目: %s\n' "$dropped" >&2
+    fi
+    if [ -n "$catbak" ]; then
+        printf 'codex-provider: 旧模型目录已备份到 %s（要回退直接覆盖回去即可）\n' "${catbak##*/}" >&2
     fi
     return 0
 }
@@ -345,7 +361,7 @@ edit_provider() {
         printf '\n刷新模型列表...\n'
         update_provider_models "$pname" || printf 'codex-provider: 模型列表刷新失败，本地缓存保持不变\n' >&2
     elif [ "$new_base" != "$base_url" ]; then
-        printf '\n提示: base_url 已变更，接着跑 `codex-provider update %s --replace` 或加 --refresh 可刷新模型列表。\n' "$pname"
+        printf '\n提示: base_url 已变更，接着跑 `codex-provider update %s`（默认 merge，保留本地条目）或加 --refresh 刷新模型列表。\n' "$pname"
     fi
     return 0
 }

@@ -44,11 +44,20 @@ codex-provider recent   # pick one of the 10 most recent sessions
 codex-provider resume tokenhub --last
 codex-provider update tokenhub           # refresh that provider's model catalog
 codex-provider update all --replace      # refresh all, drop local-only entries
+                                         # (backs the old catalogs up and lists what it drops)
 ```
 
 Provider data is stored under `${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}`.
 API keys are saved in mode `600` and exported only when a provider is started.
 Do not commit that directory or any API key files.
+
+`update NAME` merges by default: entries already in the local catalog keep their
+place and the upstream list is appended, so hand-picked models survive a refresh.
+`--replace` is the destructive one — use `codex-provider update NAME` instead when
+the upstream list is incomplete (some relays do not return every model a key can
+actually call, e.g. `gpt-5.6-luna` on openmove). It now copies the previous
+catalog to `model-catalog.json.bak-before-replace-<YYYYmmdd-HHMMSS>` and lists the
+entries it drops, so a mistake is recoverable.
 
 `edit` shows the current value as the prompt default and keeps it if you just
 press Enter, so you can change one field without retyping the rest; the API key
