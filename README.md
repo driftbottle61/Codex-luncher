@@ -44,6 +44,9 @@ codex-provider probe NAME                     # test every candidate with a real
 codex-provider probe NAME --apply             # ...then rebuild the catalog with only the usable ones
 codex-provider probe NAME --group AZ --no-verify --apply   # just take the group catalog, no requests
 codex-provider probe NAME --model gpt-5.6-luna --keep gpt-image-2 --yes --apply
+codex-provider repair NAME                    # drop undecryptable encrypted reasoning from history
+                                              # (after an api-key/group change old sessions fail with
+                                              #  invalid_encrypted_content; originals are backed up)
 codex-provider list     # list configured providers
 codex-provider go       # auto-resume the single most recent session
 codex-provider recent   # pick one of the 10 most recent sessions
@@ -129,6 +132,33 @@ codex-tokenhub-kimi-k3
 
 Selecting a model always attaches to that model's session. Detach without
 stopping Codex with `Ctrl-b`, then `d`.
+
+## Repairing a session that fails with `invalid_encrypted_content`
+
+Relays of the new-api family encrypt each reasoning item's `encrypted_content`
+per account. Rotate the api-key (or move the token to another group) and the
+items recorded under the old account can no longer be decrypted, so every
+request that replays that history fails with:
+
+```
+invalid_encrypted_content: The encrypted content for item rs_... could not be verified
+```
+
+The history itself is fine - those reasoning items are not needed to replay it.
+`codex-provider repair NAME` lists how many are affected, and (after the
+confirmation prompt, or `--yes`) rewrites each rollout file without them,
+leaving every message and tool call untouched. Originals are kept next to the
+file as `*.bak-before-repair-<timestamp>`. Narrow it with `--model M`, and
+re-run it safely: a second pass reports "nothing to do".
+
+```bash
+codex-provider repair openmove                    # count + confirm
+codex-provider repair openmove --yes              # non-interactive
+codex-provider repair openmove --model gpt-5.6-luna --yes
+```
+
+Attaching a tmux session whose credentials were rotated already tells you when
+to run this: the launcher prints the hint right after it respawns the pane.
 
 ## In-session /model switching
 

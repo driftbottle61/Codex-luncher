@@ -813,6 +813,7 @@ EOF
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
         if tmux_env_stale "$tmux_name" CODEX_PROVIDER_API_KEY "$CODEX_PROVIDER_API_KEY"; then
             printf 'codex-provider: %s 的凭证已更新，正在带新凭证重启会话（历史保留）...\n' "$name" >&2
+            printf 'codex-provider: 若该会话报 invalid_encrypted_content，可用 codex-provider repair %s 修复历史\n' "$name" >&2
             tmux set-environment -t "$tmux_name" CODEX_PROVIDER_API_KEY "$CODEX_PROVIDER_API_KEY"
             tmux respawn-pane -k -t "$tmux_name" -c "$session_dir" \
                 -e "CODEX_HOME=$session_dir" \
@@ -830,6 +831,126 @@ EOF
         -e "CODEX_PROVIDER_MODEL=$model" \
         "$cmdline"
     exec tmux attach-session -t "$tmux_name"
+}
+
+repair_provider() {
+    # 上游（new-api 中转）对 reasoning item 的 encrypted_content 是按账号加密的：
+    # 换了 key/分组之后，老会话回放这些 item 会被上游判 invalid_encrypted_content
+    # （"The encrypted content for item rs_... could not be verified"），整个会话就废了。
+    # reasoning item 对回放不是必需的，这里把它从 rollout 里摘掉，消息与工具调用原样保留。
+    local pname='' only_model='' assume_yes=0 apply=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --model) [ $# -ge 2 ] || die 'repair: --model needs a name'; only_model="$2"; shift 2 ;;
+            --model=*) only_model="${1#--model=}"; shift ;;
+            --yes|-y) assume_yes=1; shift ;;
+            --apply) apply=1; shift ;;
+            -*) die "repair: unknown option: $1" ;;
+            *) [ -z "$pname" ] || die "repair: unexpected argument: $1"; pname="$1"; shift ;;
+        esac
+    done
+    [ -n "$pname" ] || die 'usage: codex-provider repair NAME [--model M] [--yes] [--apply]'
+    local dir; dir="$(provider_dir "$pname")"
+    [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
+    if [ ! -d "$dir/sessions" ]; then
+        printf 'repair: %s 还没有会话历史（%s/sessions 不存在）\n' "$pname" "$dir"
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || die 'python3 is required to repair session history'
+    local -a files=() hits=()
+    # 点开头的目录（.tmp、手工备份的 .history-backup-* 等）不是会话，别扫进去
+    while IFS= read -r f; do files+=("$f"); done < <(find "$dir/sessions" -name '.*' -prune -o -name 'rollout-*.jsonl' -print 2>/dev/null | sort)
+    if [ -n "$only_model" ]; then
+        for f in "${files[@]}"; do case "$f" in *"/$only_model/"*) hits+=("$f") ;; esac; done
+    else
+        hits=("${files[@]}")
+    fi
+    if [ "${#hits[@]}" -eq 0 ]; then
+        printf 'repair: %s 下面没有找到 rollout 文件（%s/sessions%s）\n' "$pname" "$dir" "${only_model:+，model $only_model}"
+        return 0
+    fi
+
+    local summary nfiles nitems
+    summary="$(python3 - "${hits[@]}" <<'PY'
+import json, sys
+nfiles = nitems = 0
+for path in sys.argv[1:]:
+    try:
+        fh = open(path, encoding='utf-8')
+    except OSError:
+        continue
+    drops = 0
+    with fh:
+        for line in fh:
+            if 'encrypted_content' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get('type') != 'response_item':
+                continue
+            payload = rec.get('payload') or {}
+            if payload.get('type') == 'reasoning' and payload.get('encrypted_content'):
+                drops += 1
+    if drops:
+        nfiles += 1
+        nitems += drops
+        print('  %d item(s)  %s' % (drops, path))
+print('SUMMARY %d %d' % (nfiles, nitems))
+PY
+)"
+    printf '%s\n' "$summary" | grep -v '^SUMMARY ' | grep -v '^$' || true
+    nfiles="$(printf '%s' "$summary" | sed -n 's/.*SUMMARY \([0-9]*\) \([0-9]*\).*/\1/p')"
+    nitems="$(printf '%s' "$summary" | sed -n 's/.*SUMMARY \([0-9]*\) \([0-9]*\).*/\2/p')"
+    nfiles="${nfiles:-0}"; nitems="${nitems:-0}"
+    if [ "$nitems" -eq 0 ]; then
+        printf 'repair: %s 的会话历史没有需要处理的 encrypted reasoning item\n' "$pname"
+        return 0
+    fi
+    printf 'repair: %s 共 %s 个文件、%s 个 reasoning item 含加密内容\n' "$pname" "$nfiles" "$nitems"
+    if [ "$apply" != 1 ] && [ "$assume_yes" != 1 ]; then
+        if [ ! -t 0 ]; then
+            printf 'repair: 需要确认（用 --yes 跳过交互）\n' >&2
+            return 1
+        fi
+        local ans
+        read -r -p '要摘掉这些 reasoning item 吗？（原文件会先备份）[y/N]: ' ans
+        case "${ans:-n}" in y|Y) ;; *) printf 'repair: 已取消\n'; return 1 ;; esac
+    fi
+    python3 - "${hits[@]}" <<'PY'
+import json, os, shutil, sys, time
+stamp = time.strftime('%Y%m%d-%H%M%S')
+nfiles = nitems = 0
+for path in sys.argv[1:]:
+    with open(path, encoding='utf-8') as fh:
+        lines = fh.readlines()
+    keep = []
+    drops = 0
+    for line in lines:
+        if 'encrypted_content' in line:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                rec = None
+            if rec and rec.get('type') == 'response_item':
+                payload = rec.get('payload') or {}
+                if payload.get('type') == 'reasoning' and payload.get('encrypted_content'):
+                    drops += 1
+                    continue
+        keep.append(line)
+    if not drops:
+        continue
+    shutil.copy2(path, '%s.bak-before-repair-%s' % (path, stamp))
+    tmp = path + '.new'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        fh.writelines(keep)
+    os.replace(tmp, path)
+    nfiles += 1
+    nitems += drops
+    print('  已处理 %d item(s)  %s' % (drops, path))
+print('repair: 完成 —— %d 个文件、%d 个 reasoning item 已摘除（备份后缀 .bak-before-repair-%s）' % (nfiles, nitems, stamp))
+PY
 }
 
 # ---- tmux session environment staleness -----------------------------------
@@ -1184,6 +1305,7 @@ case "${1:-}" in
     setup) setup_provider ;;
     edit) shift; edit_provider "$@" ;;
     probe) shift; probe_provider "$@" ;;
+    repair) shift; repair_provider "$@" ;;
     groups) shift; groups_provider "$@" ;;
     list) list_providers ;;
     menu) choose_provider ;;
@@ -1224,6 +1346,10 @@ Usage:
                                        # (fields: label base_url group model wire_api key_env key)
   codex-provider groups NAME [--group G]
                                        # list the relay's groups (new-api /api/pricing)
+  codex-provider repair NAME [--model M] [--yes]
+                                       # 摘掉会话历史里上游无法解密的 encrypted
+                                       # reasoning item（换 key/分组后老会话会报
+                                       # invalid_encrypted_content）；原文件先备份
   codex-provider probe NAME [--group G] [--model M]... [--keep M]...
                            [--apply] [--no-verify] [--wide] [--jobs N]
                                        # candidates come from the token's group catalog
