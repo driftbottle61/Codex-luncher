@@ -34,7 +34,10 @@ finishes and prints the SSH note.
 
 ```bash
 codex-provider          # interactive provider/model/session menu
-codex-provider setup    # add or update a provider
+codex-provider setup    # add a provider (same name = overwrite, no prompt)
+codex-provider edit NAME                       # edit a provider in place
+codex-provider edit NAME --set model=other     # non-interactive single change
+codex-provider edit NAME --set base_url=https://x/v1 --refresh
 codex-provider list     # list configured providers
 codex-provider go       # auto-resume the single most recent session
 codex-provider recent   # pick one of the 10 most recent sessions
@@ -46,6 +49,17 @@ codex-provider update all --replace      # refresh all, drop local-only entries
 Provider data is stored under `${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}`.
 API keys are saved in mode `600` and exported only when a provider is started.
 Do not commit that directory or any API key files.
+
+`edit` shows the current value as the prompt default and keeps it if you just
+press Enter, so you can change one field without retyping the rest; the API key
+prompt is hidden and an empty answer leaves the saved key alone. Editable
+fields are `label`, `base_url`, `model`, `wire_api`, `key_env` and `key`
+(`--set key=...` rotates the key). The provider `name` is its directory and is
+not editable. Every change first copies `provider.conf` to
+`provider.conf.bak-before-edit-<YYYYmmdd-HHMMSS>` (and `api-key` likewise when
+the key changes), then prints a unified diff. Values that contain spaces are
+written quoted, since `provider.conf` is sourced by bash. `--refresh` also
+refreshes the model catalog afterwards; a failed refresh only warns.
 
 The interactive launcher uses tmux sessions named like:
 

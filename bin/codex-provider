@@ -9,6 +9,11 @@ unset MODEL_OVERRIDE SESSION_SUFFIX
 die() { printf 'codex-provider: %s\n' "$*" >&2; exit 1; }
 valid_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 provider_dir() { printf '%s/%s' "$ROOT" "$1"; }
+conf_value() {
+    # provider.conf 是被 bash source 的，含空白/特殊字符的值必须转义后再落盘，
+    # 否则下次 source 会把 "label=Alpha Pro" 的 Pro 当命令执行（rc=127）。
+    if [[ "$1" =~ ^[A-Za-z0-9_@%+=:,./?-]*$ ]]; then printf '%s' "$1"; else printf '%q' "$1"; fi
+}
 
 update_provider_models() {
     # $2 = merge（默认，保留本地已有条目，上游新增的追加在后）/ replace（纯上游列表）
@@ -207,12 +212,12 @@ setup_provider() {
     [ -n "$key" ] || die 'API key is required'
     mkdir -p "$dir/sessions"; chmod 700 "$ROOT" "$dir" "$dir/sessions"
     cat > "$dir/provider.conf" <<EOF
-name=$name
-label=$label
-base_url=$base
-model=$model
-wire_api=$wire
-key_env=$keyvar
+name=$(conf_value "$name")
+label=$(conf_value "$label")
+base_url=$(conf_value "$base")
+model=$(conf_value "$model")
+wire_api=$(conf_value "$wire")
+key_env=$(conf_value "$keyvar")
 EOF
     chmod 600 "$dir/provider.conf"
     printf '%s\n' "$key" > "$dir/api-key"
@@ -225,6 +230,124 @@ EOF
         chmod 600 "$dir/model-catalog.json"
     fi
     printf 'Configured %s. Export %s before use.\n' "$name" "$keyvar"
+}
+
+edit_provider() {
+    # 修改已有 provider：交互模式逐项回车 = 保持原值，--set field=value 走非交互。
+    # 只改写 provider.conf 的既有字段（注释/未知行原样保留），改前自动备份 .bak-before-edit-<时间戳>。
+    local pname='' do_refresh=0
+    local -a sets=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --refresh) do_refresh=1; shift ;;
+            --set) [ $# -ge 2 ] || die 'edit: --set needs field=value'; sets+=("$2"); shift 2 ;;
+            --set=*) sets+=("${1#--set=}"); shift ;;
+            --*) die "edit: unknown option: $1" ;;
+            *) if [ -z "$pname" ]; then pname="$1"; else die "edit: unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+    [ -n "$pname" ] || die 'usage: codex-provider edit NAME [--set field=value]... [--refresh]'
+    local dir; dir="$(provider_dir "$pname")"
+    [ -f "$dir/provider.conf" ] || die "unknown provider: $pname"
+
+    # 读当前值作默认值（provider.conf 不含密钥，key 单独放 api-key）
+    local name label base_url model wire_api key_env
+    unset name label base_url model wire_api key_env
+    . "$dir/provider.conf"
+    label="${label:-}"; base_url="${base_url:-}"; model="${model:-}"
+    wire_api="${wire_api:-}"; key_env="${key_env:-}"
+
+    local new_label="$label" new_base="$base_url" new_model="$model"
+    local new_wire="$wire_api" new_keyenv="$key_env" new_key='' key_changed=0
+    local kv f v ans
+    if [ "${#sets[@]}" -gt 0 ]; then
+        for kv in "${sets[@]}"; do
+            f="${kv%%=*}"; v="${kv#*=}"
+            [ "$f" != "$kv" ] || die "edit: --set expects field=value, got: $kv"
+            case "$f" in
+                label) new_label="$v" ;;
+                base_url|base-url|baseurl) new_base="$v" ;;
+                model) new_model="$v" ;;
+                wire_api|wire-api|wire) new_wire="$v" ;;
+                key_env|key-env|keyenv) new_keyenv="$v" ;;
+                key|api_key|api-key) new_key="$v"; key_changed=1 ;;
+                *) die "edit: unknown field: $f (label|base_url|model|wire_api|key_env|key)" ;;
+            esac
+        done
+    fi
+
+    if [ "${#sets[@]}" -eq 0 ]; then
+        [ -t 0 ] || die 'edit: 非交互调用请用 --set field=value，例如 codex-provider edit NAME --set model=xxx'
+        printf '编辑 %s（直接回车 = 保持原值）\n' "$pname"
+        read -r -p "Display name [$new_label]: " ans; new_label="${ans:-$new_label}"
+        read -r -p "API base URL [$new_base]: " ans; new_base="${ans:-$new_base}"
+        read -r -p "Model [$new_model]: " ans; new_model="${ans:-$new_model}"
+        read -r -p "Wire API [$new_wire]: " ans; new_wire="${ans:-$new_wire}"
+        read -r -p "API key environment variable [$new_keyenv]: " ans; new_keyenv="${ans:-$new_keyenv}"
+        read -r -s -p 'API key (留空 = 不修改): ' ans; printf '\n'
+        if [ -n "$ans" ]; then new_key="$ans"; key_changed=1; fi
+    fi
+
+    [ -n "$new_label" ] || die 'edit: display name 不能为空'
+    [[ "$new_base" =~ ^https?:// ]] || die 'edit: API base URL must start with http:// or https://'
+    [ -n "$new_model" ] || die 'edit: model 不能为空'
+    [ -n "$new_wire" ] || die 'edit: wire api 不能为空'
+    if [[ "$new_base" =~ [[:space:]] || "$new_model" =~ [[:space:]] || "$new_wire" =~ [[:space:]] ]]; then
+        die 'edit: base_url / model / wire_api 不能包含空白字符'
+    fi
+    [[ "$new_keyenv" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die 'edit: invalid environment variable name'
+    if [ "$key_changed" = 1 ] && [ -z "$new_key" ]; then die 'edit: API key 不能为空'; fi
+
+    if [ "$new_label" = "$label" ] && [ "$new_base" = "$base_url" ] && [ "$new_model" = "$model" ] \
+       && [ "$new_wire" = "$wire_api" ] && [ "$new_keyenv" = "$key_env" ] && [ "$key_changed" = 0 ]; then
+        printf '%s: 未做任何修改。\n' "$pname"
+        return 0
+    fi
+
+    local ts backup tmp line seen=''
+    ts="$(date +%Y%m%d-%H%M%S)"
+    backup="$dir/provider.conf.bak-before-edit-$ts"
+    cp -a "$dir/provider.conf" "$backup"
+    tmp="$(mktemp)"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            label=*) printf 'label=%s\n' "$(conf_value "$new_label")" >> "$tmp"; seen="$seen label" ;;
+            base_url=*) printf 'base_url=%s\n' "$(conf_value "$new_base")" >> "$tmp"; seen="$seen base_url" ;;
+            model=*) printf 'model=%s\n' "$(conf_value "$new_model")" >> "$tmp"; seen="$seen model" ;;
+            wire_api=*) printf 'wire_api=%s\n' "$(conf_value "$new_wire")" >> "$tmp"; seen="$seen wire_api" ;;
+            key_env=*) printf 'key_env=%s\n' "$(conf_value "$new_keyenv")" >> "$tmp"; seen="$seen key_env" ;;
+            *) printf '%s\n' "$line" >> "$tmp" ;;
+        esac
+    done < "$dir/provider.conf"
+    case " $seen " in *' label '*) ;; *) printf 'label=%s\n' "$(conf_value "$new_label")" >> "$tmp" ;; esac
+    case " $seen " in *' base_url '*) ;; *) printf 'base_url=%s\n' "$(conf_value "$new_base")" >> "$tmp" ;; esac
+    case " $seen " in *' model '*) ;; *) printf 'model=%s\n' "$(conf_value "$new_model")" >> "$tmp" ;; esac
+    case " $seen " in *' wire_api '*) ;; *) printf 'wire_api=%s\n' "$(conf_value "$new_wire")" >> "$tmp" ;; esac
+    case " $seen " in *' key_env '*) ;; *) printf 'key_env=%s\n' "$(conf_value "$new_keyenv")" >> "$tmp" ;; esac
+    grep -q '^name=' "$tmp" || printf 'name=%s\n' "$(conf_value "$pname")" >> "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$dir/provider.conf"
+
+    if [ "$key_changed" = 1 ]; then
+        if [ -f "$dir/api-key" ]; then cp -a "$dir/api-key" "$dir/api-key.bak-before-edit-$ts"; fi
+        printf '%s\n' "$new_key" > "$dir/api-key"
+        chmod 600 "$dir/api-key"
+        printf 'api-key 已更新（%s 字符），旧 key 备份在 api-key.bak-before-edit-%s\n' "${#new_key}" "$ts"
+    fi
+
+    printf '\n--- diff (备份 %s) ---\n' "${backup##*/}"
+    diff -u --label "${backup##*/}" --label 'provider.conf (new)' "$backup" "$dir/provider.conf" || true
+    printf '\n%s 现在的配置：\n' "$pname"
+    printf '  label=%s\n  base_url=%s\n  model=%s\n  wire_api=%s\n  key_env=%s\n' \
+        "$new_label" "$new_base" "$new_model" "$new_wire" "$new_keyenv"
+
+    if [ "$do_refresh" = 1 ]; then
+        printf '\n刷新模型列表...\n'
+        update_provider_models "$pname" || printf 'codex-provider: 模型列表刷新失败，本地缓存保持不变\n' >&2
+    elif [ "$new_base" != "$base_url" ]; then
+        printf '\n提示: base_url 已变更，接着跑 `codex-provider update %s --replace` 或加 --refresh 可刷新模型列表。\n' "$pname"
+    fi
+    return 0
 }
 
 list_providers() {
@@ -708,6 +831,7 @@ PY
 case "${1:-}" in
     '') choose_provider ;;
     setup) setup_provider ;;
+    edit) shift; edit_provider "$@" ;;
     list) list_providers ;;
     menu) choose_provider ;;
     go) shift; go_latest ;;
@@ -741,6 +865,10 @@ Usage:
   codex-provider setup
   codex-provider update NAME|all [--replace]
                                        # refresh model catalog (default: merge, keep local-only entries)
+  codex-provider edit NAME [--set field=value]... [--refresh]
+                                       # edit an existing provider; empty answer keeps
+                                       # the current value. --set is non-interactive
+                                       # (fields: label base_url model wire_api key_env key)
   codex-provider list
   codex-provider go               # auto-resume the single most recent session
   codex-provider recent [N]       # pick from the N (default 10) most recent sessions
