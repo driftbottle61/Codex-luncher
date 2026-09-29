@@ -158,3 +158,12 @@ appear alongside the managed ones in both `recent` and the interactive menu
 (shown as a `=> 恢复 legacy 历史会话 <=` entry). Legacy sessions are resumed
 with their own `config.toml` provider/key settings, so they work even if the
 provider was never added to `codex-provider`.
+
+## Codex 0.158+ 的后台 app-server（`--no-daemon`）
+
+自 codex 0.158 起，codex 会在 `$CODEX_HOME/app-server-control/` 下建 unix socket 启动后台 app-server。codex-provider 把
+`CODEX_HOME` 指向较深的会话目录（`.../providers/<name>/sessions/<model>/<suffix>`），拼接出的 socket 路径会超过 Unix socket
+的 SUN_LEN（约 108 字节），导致 `app server did not become ready`、会话一进就退。
+
+因此本版起 codex-provider 统一在启动 codex 时加 `--no-daemon`（交互会话直接前台跑，绕过后台 daemon）。这不影响 tmux 交互用法，
+只放弃后台 daemon 特性。以后若 codex 的 daemon/目录行为再变，留意这个开关。

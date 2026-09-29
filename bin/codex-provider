@@ -368,18 +368,18 @@ $(if [ "$name" = "tokenhub" ]; then printf 'disable_response_storage = true\n'; 
 trust_level = "trusted"
 EOF
     chmod 600 "$session_dir/config.toml"
-    command -v tmux >/dev/null 2>&1 || exec "$CODEX" -s danger-full-access "$@"
+    command -v tmux >/dev/null 2>&1 || exec "$CODEX" -s danger-full-access --no-daemon "$@"
     local tmux_name="codex-${name}-${model}${SESSION_SUFFIX:+-$SESSION_SUFFIX}"
     # Dots have special meaning in tmux targets (window.pane), so avoid them.
     tmux_name="${tmux_name//[^A-Za-z0-9_-]/-}"
     if [ ! -t 0 ]; then
-        exec "$CODEX" -s danger-full-access "$@"
+        exec "$CODEX" -s danger-full-access --no-daemon "$@"
     fi
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
         exec tmux attach-session -t "$tmux_name"
     fi
     local cmdline
-    printf -v cmdline '%q ' "$CODEX" -s danger-full-access "$@"
+    printf -v cmdline '%q ' "$CODEX" -s danger-full-access --no-daemon "$@"
     tmux new-session -d -s "$tmux_name" -c "$session_dir" \
         -e "CODEX_HOME=$session_dir" \
         -e "CODEX_PROVIDER_API_KEY=${CODEX_PROVIDER_API_KEY}" \
@@ -481,12 +481,12 @@ run_legacy_home() {
     tmux_name="codex-legacy-${tag//[^A-Za-z0-9_-]/-}-${sid//[^A-Za-z0-9_-]/-}"
     cd "$home"
     if [ ! -t 0 ]; then
-        exec "$CODEX" -s danger-full-access resume "$sid"
+        exec "$CODEX" -s danger-full-access --no-daemon resume "$sid"
     fi
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
         exec tmux attach-session -t "$tmux_name"
     fi
-    printf -v cmdline '%q ' "$CODEX" -s danger-full-access resume "$sid"
+    printf -v cmdline '%q ' "$CODEX" -s danger-full-access --no-daemon resume "$sid"
     if [ -n "$envkey" ] && [ -n "${!envkey:-}" ]; then
         tmux new-session -d -s "$tmux_name" -c "$home" \
             -e "CODEX_HOME=$home" -e "$envkey=${!envkey}" "$cmdline"
