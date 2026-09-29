@@ -217,6 +217,12 @@ fi
 - Detaching with `Ctrl-b d` returns to the login shell (normal admin shell).
 - Exiting Codex inside tmux closes the window; the next `recent`/`go` restarts
   a fresh Codex that resumes the same session.
+- Re-attaching a *live* tmux session also refreshes credentials: if the saved
+  `api-key` no longer matches what that pane was started with, the pane is
+  respawned with the current value instead of silently keeping the stale key
+  (which surfaces as a confusing upstream `503 No available channel for model
+  ...`). Codex history lives on disk, so the respawn resumes the same
+  conversation.
 - The last menu entry starts a new session through the original
   provider/model picker (`codex-provider menu`).
 - First run is self-guiding: when no provider and no session exists yet, the

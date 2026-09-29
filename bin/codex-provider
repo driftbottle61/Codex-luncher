@@ -808,11 +808,21 @@ EOF
     if [ ! -t 0 ]; then
         exec "$CODEX" -s danger-full-access --no-daemon "$@"
     fi
-    if tmux has-session -t "$tmux_name" 2>/dev/null; then
-        exec tmux attach-session -t "$tmux_name"
-    fi
     local cmdline
     printf -v cmdline '%q ' "$CODEX" -s danger-full-access --no-daemon "$@"
+    if tmux has-session -t "$tmux_name" 2>/dev/null; then
+        if tmux_env_stale "$tmux_name" CODEX_PROVIDER_API_KEY "$CODEX_PROVIDER_API_KEY"; then
+            printf 'codex-provider: %s 的凭证已更新，正在带新凭证重启会话（历史保留）...\n' "$name" >&2
+            tmux set-environment -t "$tmux_name" CODEX_PROVIDER_API_KEY "$CODEX_PROVIDER_API_KEY"
+            tmux respawn-pane -k -t "$tmux_name" -c "$session_dir" \
+                -e "CODEX_HOME=$session_dir" \
+                -e "CODEX_PROVIDER_API_KEY=$CODEX_PROVIDER_API_KEY" \
+                -e "CODEX_PROVIDER_NAME=$name" \
+                -e "CODEX_PROVIDER_MODEL=$model" \
+                "$cmdline"
+        fi
+        exec tmux attach-session -t "$tmux_name"
+    fi
     tmux new-session -d -s "$tmux_name" -c "$session_dir" \
         -e "CODEX_HOME=$session_dir" \
         -e "CODEX_PROVIDER_API_KEY=${CODEX_PROVIDER_API_KEY}" \
@@ -820,6 +830,32 @@ EOF
         -e "CODEX_PROVIDER_MODEL=$model" \
         "$cmdline"
     exec tmux attach-session -t "$tmux_name"
+}
+
+# ---- tmux session environment staleness -----------------------------------
+# tmux 里已经跑着的进程不会被 set-environment 影响：会话建好之后 provider 换了
+# api-key（或 key 环境变量改名），attach 上去的老进程还在用旧凭证，表现就是上游
+# 回 "No available channel" 之类莫名其妙的 503。这里在 attach 前比对一次，
+# 不一致就带新环境 respawn 掉这个 pane（codex 的会话历史在磁盘上，不丢）。
+tmux_env_value() {  # tmux_env_value SESSION NAME
+    tmux show-environment -t "$1" "$2" 2>/dev/null | sed -n "s/^$2=//p"
+}
+
+proc_env_value() {  # proc_env_value SESSION NAME  (读 pane 里实际进程的环境)
+    local pid
+    pid="$(tmux list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    [ -n "$pid" ] && [ -r "/proc/$pid/environ" ] || return 0
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n "s/^$2=//p" | head -1
+}
+
+tmux_env_stale() {  # tmux_env_stale SESSION NAME WANT -> 0 表示需要刷新
+    local cur
+    [ -n "${3:-}" ] || return 1
+    cur="$(tmux_env_value "$1" "$2")"
+    [ -n "$cur" ] && [ "$cur" != "$3" ] && return 0
+    cur="$(proc_env_value "$1" "$2")"
+    [ -n "$cur" ] && [ "$cur" != "$3" ] && return 0
+    return 1
 }
 
 # ---- legacy codex homes (CODEX_HOMEs not managed by codex-provider) ----
@@ -916,10 +952,15 @@ run_legacy_home() {
     if [ ! -t 0 ]; then
         exec "$CODEX" -s danger-full-access --no-daemon resume "$sid"
     fi
+    printf -v cmdline '%q ' "$CODEX" -s danger-full-access --no-daemon resume "$sid"
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
+        if [ -n "$envkey" ] && tmux_env_stale "$tmux_name" "$envkey" "${!envkey:-}"; then
+            printf 'codex-provider: %s 已更新，正在带新凭证重启会话（历史保留）...\n' "$envkey" >&2
+            tmux set-environment -t "$tmux_name" "$envkey" "${!envkey}"
+            tmux respawn-pane -k -t "$tmux_name" -c "$home" -e "CODEX_HOME=$home" -e "$envkey=${!envkey}" "$cmdline"
+        fi
         exec tmux attach-session -t "$tmux_name"
     fi
-    printf -v cmdline '%q ' "$CODEX" -s danger-full-access --no-daemon resume "$sid"
     if [ -n "$envkey" ] && [ -n "${!envkey:-}" ]; then
         tmux new-session -d -s "$tmux_name" -c "$home" \
             -e "CODEX_HOME=$home" -e "$envkey=${!envkey}" "$cmdline"
