@@ -813,6 +813,11 @@ name = "$label"
 base_url = "$base_url"
 env_key = "CODEX_PROVIDER_API_KEY"
 wire_api = "$wire_api"
+# 中转基本都跑在共享配额上（实测 openmove/AZ = Azure japaneast 的 token rate limit，
+# 几分钟后自己恢复）。codex 默认只重试几次，这里放宽，让它自己熬过 429/503 的短窗口，
+# 并把上游的 Retry-After 用上；真正的故障仍会照常报错。
+request_max_retries = 8
+stream_max_retries = 8
 $(if [ "$name" = "tokenhub" ]; then printf 'disable_response_storage = true\n'; fi)
 
 [projects."$session_dir"]

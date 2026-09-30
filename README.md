@@ -134,6 +134,29 @@ codex-tokenhub-kimi-k3
 Selecting a model always attaches to that model's session. Detach without
 stopping Codex with `Ctrl-b`, then `d`.
 
+## Retries (rate limits on shared relay capacity)
+
+Relays are usually backed by shared quota - openmove's `AZ` group, for example,
+is Azure `japaneast` and occasionally answers
+
+```
+rate limit exceeded: Your requests to gpt-5.6-luna for gpt-5.6-luna in japaneast
+have exceeded token rate limit
+```
+
+for a minute or two before recovering on its own. Generated session configs
+therefore set `request_max_retries = 8` and `stream_max_retries = 8` (codex
+honours the upstream `Retry-After`), so a short quota window is ridden out
+instead of surfacing as an error. Verified in practice:
+
+```
+ERROR: Reconnecting... 1/8
+codex
+ok
+```
+
+Nothing else changes: a real outage still fails, just after more attempts.
+
 ## Repairing a session that fails with `invalid_encrypted_content`
 
 Relays of the new-api family encrypt each reasoning item's `encrypted_content`
