@@ -45,6 +45,7 @@ codex-provider probe NAME --apply             # ...then rebuild the catalog with
 codex-provider probe NAME --group AZ --no-verify --apply   # just take the group catalog, no requests
 codex-provider probe NAME --model gpt-5.6-luna --keep gpt-image-2 --yes --apply
 codex-provider repair NAME                    # drop undecryptable encrypted reasoning from history
+codex-provider edit NAME --set strip_reasoning=1   # ...or do it automatically on every entry
                                               # (after an api-key/group change old sessions fail with
                                               #  invalid_encrypted_content; originals are backed up)
 codex-provider list     # list configured providers
@@ -159,6 +160,29 @@ codex-provider repair openmove --model gpt-5.6-luna --yes
 
 Attaching a tmux session whose credentials were rotated already tells you when
 to run this: the launcher prints the hint right after it respawns the pane.
+
+### Doing it automatically: `strip_reasoning=1`
+
+A relay can also hand back a *single* reasoning item nobody can decrypt any
+more (seen in practice: one item out of 124 returns 400 while its siblings
+return 200). One such item is enough to brick the whole conversation, so
+`repair` supports an automatic mode per provider:
+
+```bash
+codex-provider edit openmove --set strip_reasoning=1   # enable
+codex-provider edit openmove --set strip_reasoning=     # disable
+```
+
+With it on, every entry into an existing session strips undecryptable
+reasoning items from that session's rollout first and prints
+`已摘除 N 处上游解不开的 encrypted reasoning item（历史消息保留）`. Messages,
+tool calls and their output are never touched. The first automatic pass keeps a
+`*.bak-before-repair-<timestamp>` copy; later passes reuse it instead of piling
+up more backups (`repair` itself always writes a fresh, timestamped backup).
+
+Note the trade-off: replayed history loses the reasoning *summaries* of past
+turns. Those are cosmetic for the model (they are re-derived), but the resumed
+transcript will not show them for old turns.
 
 ## In-session /model switching
 
