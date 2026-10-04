@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT="${CODEX_PROVIDER_ROOT:-/root/.codex-providers}"
 # codex-provider 自身版本（发版时和 git tag 一起改），用于升级检查
-PROVIDER_VERSION="0.6.0"
+PROVIDER_VERSION="0.6.1"
 # 升级检查缓存（codex 的最新版取自 npm registry；codex-provider 取自 GitHub releases）
 # 由 refresh_upgrade_cache 每天最多刷新一次
 UPGRADE_CACHE="$ROOT/upgrade-check.json"
@@ -738,6 +738,10 @@ choose_provider() {
             fi
         elif [ "$REPLY" = q ]; then
             exit 0
+        elif [ "$REPLY" = u ]; then
+            upgrade_provider || true
+        elif [ "$REPLY" = U ]; then
+            upgrade_provider --launcher || true
         else
             echo 'Invalid selection.'
         fi
@@ -1314,6 +1318,8 @@ PY
         read -r -p '选择: ' sel || exit 0
         case "$sel" in
             q|Q) exit 0 ;;
+            u) upgrade_provider || true; continue ;;
+            U) upgrade_provider --launcher || true; continue ;;
             ''|*[!0-9]*) echo '无效输入'; continue ;;
         esac
         if [ "$sel" -ge 1 ] && [ "$sel" -le "$total" ]; then
@@ -1429,12 +1435,16 @@ upgrade_hint() {
     cur_c="$(installed_codex_version)"; new_c="$(upgrade_cache_field codex)"
     cur_p="$PROVIDER_VERSION"; new_p="$(upgrade_cache_field launcher)"
     if version_gt "$new_c" "$cur_c"; then
-        printf '\n⬆ codex 有新版本：%s → %s（升级：codex-provider upgrade）\n' "$cur_c" "$new_c"
+        printf '\n⬆ codex 有新版本：%s → %s（按 u 直接升级 / codex-provider upgrade）\n' "$cur_c" "$new_c"
     fi
     if version_gt "$new_p" "$cur_p"; then
-        printf '⬆ codex-provider 有新版本：%s → %s（升级：codex-provider upgrade --launcher）\n' "$cur_p" "$new_p"
+        printf '⬆ codex-provider 有新版本：%s → %s（按 U 直接升级 / codex-provider upgrade --launcher）\n' "$cur_p" "$new_p"
     fi
 }
+
+# 菜单里按 u / U 触发升级，出错时只报错、不要把整个 launcher 顶掉，所以这里
+# 用 return 1 而不是 die（die 会 exit）。
+upgrade_fail() { printf 'codex-provider: %s\n' "$*" >&2; return 1; }
 
 upgrade_provider() {
     local want_launcher=0 check_only=0 ans cur new
@@ -1442,13 +1452,13 @@ upgrade_provider() {
         case "$a" in
             --check) check_only=1 ;;
             --launcher) want_launcher=1 ;;
-            *) die "unknown option: $a" ;;
+            *) upgrade_fail "unknown option: $a"; return 1 ;;
         esac
     done
     if [ "$want_launcher" = 0 ]; then
         cur="$(installed_codex_version)"; new="$(latest_codex_version)"
-        [ -n "$cur" ] || die 'detect 不到已安装的 codex 版本'
-        [ -n "$new" ] || die '无法获取 codex 最新版（registry.npmjs.org 不可达）'
+        [ -n "$cur" ] || { upgrade_fail 'detect 不到已安装的 codex 版本'; return 1; }
+        [ -n "$new" ] || { upgrade_fail '无法获取 codex 最新版（registry.npmjs.org 不可达）'; return 1; }
         printf 'codex           本地 %s   最新 %s\n' "$cur" "$new"
         if ! version_gt "$new" "$cur"; then
             echo 'codex 已是最新。'
@@ -1461,15 +1471,15 @@ upgrade_provider() {
                 y|Y) ;;
                 *) echo '已取消。'; return 0 ;;
             esac
-            command -v curl >/dev/null 2>&1 || die 'curl is required'
-            curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh || die 'codex 升级脚本执行失败'
+            command -v curl >/dev/null 2>&1 || { upgrade_fail 'curl is required'; return 1; }
+            curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh || { upgrade_fail 'codex 升级脚本执行失败'; return 1; }
             hash -r
             echo "codex 升级完成：$(installed_codex_version)（已开的会话仍跑旧进程，重进即可）"
         fi
     fi
     if [ "$want_launcher" = 1 ]; then
         cur="$PROVIDER_VERSION"; new="$(latest_launcher_version)"
-        [ -n "$new" ] || die '无法获取 codex-provider 最新版（api.github.com 不可达）'
+        [ -n "$new" ] || { upgrade_fail '无法获取 codex-provider 最新版（api.github.com 不可达）'; return 1; }
         printf 'codex-provider  本地 %s   最新 %s\n' "$cur" "$new"
         if ! version_gt "$new" "$cur"; then
             echo 'codex-provider 已是最新。'
@@ -1482,7 +1492,7 @@ upgrade_provider() {
             y|Y) ;;
             *) echo '已取消。'; return 0 ;;
         esac
-        curl -fsSL "https://raw.githubusercontent.com/driftbottle61/Codex-luncher/v$new/install.sh" | bash || die 'codex-provider 升级脚本执行失败'
+        curl -fsSL "https://raw.githubusercontent.com/driftbottle61/Codex-luncher/v$new/install.sh" | bash || { upgrade_fail 'codex-provider 升级脚本执行失败'; return 1; }
         echo 'codex-provider 已升级，重新运行即可生效。'
     fi
 }

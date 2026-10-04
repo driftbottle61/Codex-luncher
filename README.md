@@ -153,6 +153,11 @@ official standalone installer codex's `Update now` would have run - but outside
 the TUI, so the running session is not killed. The check happens at most once a
 day and is cached in `$CODEX_PROVIDER_ROOT/upgrade-check.json`.
 
+At the menu prompt (and at the `recent` picker prompt) you can skip the shell
+round-trip: type `u` to upgrade codex, or `U` to upgrade codex-provider. Both
+still print the exact command and ask for confirmation before running anything,
+and a failed check just prints an error and returns you to the menu.
+
 ## Retries (rate limits on shared relay capacity)
 
 Relays are usually backed by shared quota - openmove's `AZ` group, for example,
