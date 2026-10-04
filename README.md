@@ -158,6 +158,26 @@ round-trip: type `u` to upgrade codex, or `U` to upgrade codex-provider. Both
 still print the exact command and ask for confirmation before running anything,
 and a failed check just prints an error and returns you to the menu.
 
+## Model display names
+
+`codex-provider update` merges the upstream list into the local catalog: local
+entries keep their order and anything the upstream no longer returns is kept
+(only `update --replace` drops those). Each entry carries `display_name`, which
+is what codex shows in its model picker.
+
+Upstream `name` is only meaningful on a real model API - `GET /models` on the
+official DeepSeek endpoint reports `deepseek-flash` as `DeepSeek-V4.1-Flash`. On
+new-api-style relays the group catalog built from `/api/pricing` has `name`
+equal to the id, so it carries no display information at all.
+
+Because of that, a refresh only rewrites `display_name` when the upstream name
+is a real one (non-empty **and** different from the id) **and** the local entry
+has no hand-written name of its own - i.e. its `display_name` is empty, equal to
+the id, or was itself written by an earlier refresh (marked with
+`display_name_source: upstream`). Hand-crafted names are never overwritten, so
+the 143 pretty names in a relay catalog survive every refresh, while a
+`deepseek-flash` that still shows as its bare id picks up `DeepSeek-V4.1-Flash`.
+
 ## Retries (rate limits on shared relay capacity)
 
 Relays are usually backed by shared quota - openmove's `AZ` group, for example,

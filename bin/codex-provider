@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT="${CODEX_PROVIDER_ROOT:-/root/.codex-providers}"
 # codex-provider 自身版本（发版时和 git tag 一起改），用于升级检查
-PROVIDER_VERSION="0.6.1"
+PROVIDER_VERSION="0.6.2"
 # 升级检查缓存（codex 的最新版取自 npm registry；codex-provider 取自 GitHub releases）
 # 由 refresh_upgrade_cache 每天最多刷新一次
 UPGRADE_CACHE="$ROOT/upgrade-check.json"
@@ -71,14 +71,29 @@ update_provider_models() {
     fi
     # 合并策略：本地条目按原顺序在前（手工挑选/自建的模型不会被一次刷新抹掉），
     # 上游返回而本地没有的追加在后面。本地目录缺失或损坏则退回纯上游列表。
+    # 显示名：上游 /models 的 name 是给人看的（如 deepseek-flash → DeepSeek-V4.1-Flash），
+    # 而 /api/pricing 分组目录里 name 就等于 id。所以只有「上游 name 非空且 != id」才算
+    # 真实展示名；且只覆盖没有手工名字的条目（display_name 为空/等于 id/本身就是上次从
+    # 上游写进来的 display_name_source=upstream），手工美化过的名字一律保留。
     oldjson='{"models":[]}'
     if [ "$mode" != replace ] && [ -f "$dir/model-catalog.json" ]; then
         oldjson="$(<"$dir/model-catalog.json")"
     fi
     if ! jq -e --argjson old "$oldjson" '
           def uniqbyid: reduce .[] as $x ([]; if any(.[]; .id == $x.id) then . else . + [$x] end);
-          [ (($old.models // [])[]),
-            ((.data // .models // [])[] | (.id // .slug) as $id | select($id != null) | {slug:$id,id:$id,display_name:(.name // $id)}) ]
+          ($old.models // []) as $oldm
+          | [ (.data // .models // [])[]
+              | (.id // .slug) as $id | select($id != null)
+              | {slug:$id, id:$id, name:(.name // "")} ] as $up
+          | [ $oldm[] as $o
+              | ($up | map(select(.id == $o.id)) | .[0]) as $u
+              | if ($u != null) and ($u.name != "") and ($u.name != $o.id)
+                     and ((($o.display_name // "") == "") or ($o.display_name == $o.id)
+                          or (($o.display_name_source // "") == "upstream"))
+                then $o + {display_name: $u.name, display_name_source: "upstream"}
+                else $o end ]
+            + [ $up[] | .id as $uid | select(([ $oldm[].id ] | index($uid)) == null)
+                | {slug:.id, id:.id, display_name:(if .name != "" then .name else .id end), display_name_source: "upstream"} ]
           | uniqbyid | {models: .}
         ' "$tmp" > "$merged" 2>/dev/null; then
         jq -e '{models: [(.data // .models // [])[] | (.id // .slug) as $id | select($id != null) | {slug:$id,id:$id,display_name:(.name // $id)}]}' "$tmp" > "$merged" || { rm -f "$tmp" "$merged"; return 1; }
