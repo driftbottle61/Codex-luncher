@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 
 ROOT="${CODEX_PROVIDER_ROOT:-/root/.codex-providers}"
+# codex-provider 自身版本（发版时和 git tag 一起改），用于升级检查
+PROVIDER_VERSION="0.6.0"
+# 升级检查缓存（codex 的最新版取自 npm registry；codex-provider 取自 GitHub releases）
+# 由 refresh_upgrade_cache 每天最多刷新一次
+UPGRADE_CACHE="$ROOT/upgrade-check.json"
 CODEX="$(command -v codex)"
 # codex 0.158 起带后台 app-server daemon，在很深的 CODEX_HOME 下 unix socket 路径会超
 # SUN_LEN，必须加 --no-daemon；但 0.158 之前的版本不认识这个参数（会以
@@ -709,6 +714,8 @@ choose_provider() {
         choose_provider
         return 0
     fi
+    refresh_upgrade_cache
+    upgrade_hint
     PS3='Select provider (q to quit): '
     select sel in "${items[@]}"; do
         if [[ "$REPLY" =~ ^[0-9]+$ ]]; then
@@ -1294,6 +1301,8 @@ PY
         choose_provider
         return 0
     fi
+    refresh_upgrade_cache
+    upgrade_hint
     while true; do
         printf '\n最近 %d 个会话（按最后活跃排序，选编号进入）:\n' "$total"
         for ((i=0; i<total; i++)); do
@@ -1329,6 +1338,155 @@ PY
     done
 }
 
+# ---- 版本检查 / 升级 -------------------------------------------------------
+# 结论（2026-10-04 实测）：codex 的“Update available”提示只在它能把自己的安装
+# 识别为 standalone/npm 等「受管安装」时才显示，而识别依赖 CODEX_HOME 就是安装
+# 所在的那个 home；codex-provider 为了多 provider 隔离会把 CODEX_HOME 指到
+# 每个会话自己的目录 ⇒ codex 把自己判成 “manual or unknown” ⇒ 永远不提示升级。
+# 所以升级提示改由 codex-provider 自己给（不依赖 codex 的横幅），升级动作也由
+# 本脚本在会话外执行官方安装器，避免在 TUI 里点 “Update now” 把会话顶掉。
+installed_codex_version() {
+    [ -n "${CODEX:-}" ] || return 0
+    "$CODEX" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+}
+
+version_gt() {  # $1 比 $2 新？
+    [ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+    [ "$1" = "$2" ] && return 1
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
+}
+
+latest_codex_version() {
+    local json=''
+    command -v curl >/dev/null 2>&1 || return 0
+    json="$(curl -fsS --max-time 6 https://registry.npmjs.org/@openai/codex/latest 2>/dev/null || true)"
+    [ -n "$json" ] || return 0
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$json" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("version",""))
+except Exception:
+    pass' 2>/dev/null
+        return 0
+    fi
+    printf '%s' "$json" | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
+}
+
+latest_launcher_version() {
+    local json=''
+    command -v curl >/dev/null 2>&1 || return 0
+    json="$(curl -fsS --max-time 6 https://api.github.com/repos/driftbottle61/Codex-luncher/releases/latest 2>/dev/null || true)"
+    [ -n "$json" ] || return 0
+    printf '%s' "$json" | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v?[0-9]+\.[0-9]+\.[0-9]+"' | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
+}
+
+upgrade_cache_field() {  # $1 = codex | launcher | checked_at
+    [ -s "$UPGRADE_CACHE" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 -c 'import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2],"") or "")
+except Exception:
+    pass' "$UPGRADE_CACHE" "$1" 2>/dev/null
+}
+
+refresh_upgrade_cache() {
+    # 每天最多一次；失败保持旧值（不写半截）。菜单进入时调用，最多阻塞约 12s/天。
+    local now last c l tmp
+    command -v python3 >/dev/null 2>&1 || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    now="$(date +%s)"
+    last="$(upgrade_cache_field checked_at)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ $((now - last)) -lt 86400 ] && return 0
+    c="$(latest_codex_version)"; l="$(latest_launcher_version)"
+    # 即便这次没查到（离线 / curl 失败）也写 checked_at，否则菜单每次打开都会
+    # 重试并各卡最多 6s；查不到的字段留空即视为「未知」，不触发提示。
+    tmp="$UPGRADE_CACHE.tmp"
+    if [ -s "$UPGRADE_CACHE" ]; then
+        python3 - "$UPGRADE_CACHE" "$tmp" "$c" "$l" "$now" <<'PY' || { rm -f "$tmp"; return 0; }
+import json, sys
+path, out, codex, launcher, now = sys.argv[1:6]
+try:
+    data = json.load(open(path))
+except Exception:
+    data = {}
+if codex:
+    data["codex"] = codex
+if launcher:
+    data["launcher"] = launcher
+data["checked_at"] = int(now)
+json.dump(data, open(out, "w"))
+PY
+    else
+        printf '{"codex":"%s","launcher":"%s","checked_at":%s}\n' "$c" "$l" "$now" > "$tmp"
+    fi
+    mv "$tmp" "$UPGRADE_CACHE"
+}
+
+upgrade_hint() {
+    local cur_c new_c cur_p new_p
+    cur_c="$(installed_codex_version)"; new_c="$(upgrade_cache_field codex)"
+    cur_p="$PROVIDER_VERSION"; new_p="$(upgrade_cache_field launcher)"
+    if version_gt "$new_c" "$cur_c"; then
+        printf '\n⬆ codex 有新版本：%s → %s（升级：codex-provider upgrade）\n' "$cur_c" "$new_c"
+    fi
+    if version_gt "$new_p" "$cur_p"; then
+        printf '⬆ codex-provider 有新版本：%s → %s（升级：codex-provider upgrade --launcher）\n' "$cur_p" "$new_p"
+    fi
+}
+
+upgrade_provider() {
+    local want_launcher=0 check_only=0 ans cur new
+    for a in "$@"; do
+        case "$a" in
+            --check) check_only=1 ;;
+            --launcher) want_launcher=1 ;;
+            *) die "unknown option: $a" ;;
+        esac
+    done
+    if [ "$want_launcher" = 0 ]; then
+        cur="$(installed_codex_version)"; new="$(latest_codex_version)"
+        [ -n "$cur" ] || die 'detect 不到已安装的 codex 版本'
+        [ -n "$new" ] || die '无法获取 codex 最新版（registry.npmjs.org 不可达）'
+        printf 'codex           本地 %s   最新 %s\n' "$cur" "$new"
+        if ! version_gt "$new" "$cur"; then
+            echo 'codex 已是最新。'
+        else
+            [ "$check_only" = 1 ] && { echo '（--check：仅检查，未升级）'; return 1; }
+            printf '升级命令（= codex 应用内 “Update now” 用的那条，官方 standalone 安装器）:\n'
+            printf '  curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh\n'
+            read -r -p '现在执行升级？[y/N] ' ans
+            case "$ans" in
+                y|Y) ;;
+                *) echo '已取消。'; return 0 ;;
+            esac
+            command -v curl >/dev/null 2>&1 || die 'curl is required'
+            curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh || die 'codex 升级脚本执行失败'
+            hash -r
+            echo "codex 升级完成：$(installed_codex_version)（已开的会话仍跑旧进程，重进即可）"
+        fi
+    fi
+    if [ "$want_launcher" = 1 ]; then
+        cur="$PROVIDER_VERSION"; new="$(latest_launcher_version)"
+        [ -n "$new" ] || die '无法获取 codex-provider 最新版（api.github.com 不可达）'
+        printf 'codex-provider  本地 %s   最新 %s\n' "$cur" "$new"
+        if ! version_gt "$new" "$cur"; then
+            echo 'codex-provider 已是最新。'
+            return 0
+        fi
+        [ "$check_only" = 1 ] && { echo '（--check：仅检查，未升级）'; return 1; }
+        printf '升级命令:\n  curl -fsSL https://raw.githubusercontent.com/driftbottle61/Codex-luncher/v%s/install.sh | sudo bash\n' "$new"
+        read -r -p '现在执行升级？[y/N] ' ans
+        case "$ans" in
+            y|Y) ;;
+            *) echo '已取消。'; return 0 ;;
+        esac
+        curl -fsSL "https://raw.githubusercontent.com/driftbottle61/Codex-luncher/v$new/install.sh" | bash || die 'codex-provider 升级脚本执行失败'
+        echo 'codex-provider 已升级，重新运行即可生效。'
+    fi
+}
+
 case "${1:-}" in
     '') choose_provider ;;
     setup) setup_provider ;;
@@ -1340,6 +1498,7 @@ case "${1:-}" in
     menu) choose_provider ;;
     go) shift; go_latest ;;
     recent) shift; pick_recent "${1:-10}" ;;
+    upgrade) shift; upgrade_provider "$@" ;;
     update)
         shift
         update_mode=merge; update_target=''
@@ -1350,7 +1509,7 @@ case "${1:-}" in
                 *) if [ -z "$update_target" ]; then update_target="$a"; fi ;;
             esac
         done
-        [ -n "$update_target" ] || die 'usage: codex-provider update NAME|all [--replace]'
+        [ -n "$update_target" ] || die 'usage: codex-provider update NAME|all [--replace]（这里更新的是 provider 的模型目录；升级 codex / codex-provider 请用 codex-provider upgrade）'
         if [ "$update_target" = all ]; then
             for d in "$ROOT"/*; do
                 [ -f "$d/provider.conf" ] || continue
@@ -1369,6 +1528,9 @@ Usage:
   codex-provider setup
   codex-provider update NAME|all [--replace]
                                        # refresh model catalog (default: merge, keep local-only entries)
+  codex-provider upgrade [--check] [--launcher]
+                                       # 检查并升级 codex（官方 standalone 安装器）或
+                                       # codex-provider（GitHub 最新 Release）
   codex-provider edit NAME [--set field=value]... [--refresh]
                                        # edit an existing provider; empty answer keeps
                                        # the current value. --set is non-interactive

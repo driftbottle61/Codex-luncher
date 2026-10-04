@@ -55,6 +55,9 @@ codex-provider resume tokenhub --last
 codex-provider update tokenhub           # refresh that provider's model catalog
 codex-provider update all --replace      # refresh all, drop local-only entries
                                          # (backs the old catalogs up and lists what it drops)
+codex-provider upgrade                   # check + upgrade codex (official standalone installer)
+codex-provider upgrade --check           # only report; change nothing
+codex-provider upgrade --launcher        # upgrade codex-provider itself from GitHub releases
 ```
 
 Provider data is stored under `${CODEX_PROVIDER_ROOT:-$HOME/.codex-providers}`.
@@ -133,6 +136,22 @@ codex-tokenhub-kimi-k3
 
 Selecting a model always attaches to that model's session. Detach without
 stopping Codex with `Ctrl-b`, then `d`.
+
+## Upgrading codex
+
+Codex only shows its own `Update available` banner when it recognises its
+installation as a *managed* one (standalone / npm / brew ...), and that
+detection keys off `CODEX_HOME` being the home the install lives in. This
+launcher points `CODEX_HOME` at a per-session directory (that is what keeps
+providers isolated), so codex sees itself as "other" and never offers the
+update - and picking `Update now` if it ever does appear just tears the session
+down without installing anything.
+
+So the launcher does the check itself: the menu prints a hint when a newer
+codex (or codex-provider) is out, and `codex-provider upgrade` runs the same
+official standalone installer codex's `Update now` would have run - but outside
+the TUI, so the running session is not killed. The check happens at most once a
+day and is cached in `$CODEX_PROVIDER_ROOT/upgrade-check.json`.
 
 ## Retries (rate limits on shared relay capacity)
 
