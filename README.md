@@ -321,5 +321,9 @@ provider was never added to `codex-provider`.
 `CODEX_HOME` 指向较深的会话目录（`.../providers/<name>/sessions/<model>/<suffix>`），拼接出的 socket 路径会超过 Unix socket
 的 SUN_LEN（约 108 字节），导致 `app server did not become ready`、会话一进就退。
 
-因此本版起 codex-provider 统一在启动 codex 时加 `--no-daemon`（交互会话直接前台跑，绕过后台 daemon）。这不影响 tmux 交互用法，
+因此 codex-provider 在启动 codex 时会加 `--no-daemon`（交互会话直接前台跑，绕过后台 daemon）。这不影响 tmux 交互用法，
 只放弃后台 daemon 特性。以后若 codex 的 daemon/目录行为再变，留意这个开关。
+
+注意：`--no-daemon` 是 codex 0.158 才引入的参数，0.158 之前的版本不认识它，会直接报
+`unexpected argument '--no-daemon'` 并以非零码退出（表现为「选新建会话后秒退」）。所以 codex-provider 会先探测
+`codex --version`，只有 ≥ 0.158 时才追加该参数；旧版 codex 直接照常启动。旧机器想用到新版行为再单独升级 codex 即可。

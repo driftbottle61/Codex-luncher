@@ -3,6 +3,17 @@ set -Eeuo pipefail
 
 ROOT="${CODEX_PROVIDER_ROOT:-/root/.codex-providers}"
 CODEX="$(command -v codex)"
+# codex 0.158 起带后台 app-server daemon，在很深的 CODEX_HOME 下 unix socket 路径会超
+# SUN_LEN，必须加 --no-daemon；但 0.158 之前的版本不认识这个参数（会以
+# "unexpected argument '--no-daemon'" 直接退出），所以按版本判断，只在新版上追加。
+CODEX_NO_DAEMON=""
+if [ -n "${CODEX:-}" ]; then
+    _codex_ver="$("$CODEX" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    if [ -n "$_codex_ver" ] && [ "$(printf '%s\n%s\n' "$_codex_ver" 0.158.0 | sort -V | head -n1)" = "0.158.0" ]; then
+        CODEX_NO_DAEMON="--no-daemon"
+    fi
+    unset _codex_ver
+fi
 # 环境里残留的 MODEL_OVERRIDE / SESSION_SUFFIX（例如从某个 codex tmux 会话继承来的）
 # 会悄悄改写本次要进入的模型和会话目录，这里先清掉；本脚本内部调用时会显式传入。
 unset MODEL_OVERRIDE SESSION_SUFFIX
@@ -824,15 +835,15 @@ $(if [ "$name" = "tokenhub" ]; then printf 'disable_response_storage = true\n'; 
 trust_level = "trusted"
 EOF
     chmod 600 "$session_dir/config.toml"
-    command -v tmux >/dev/null 2>&1 || exec "$CODEX" -s danger-full-access --no-daemon "$@"
+    command -v tmux >/dev/null 2>&1 || exec "$CODEX" -s danger-full-access $CODEX_NO_DAEMON "$@"
     local tmux_name="codex-${name}-${model}${SESSION_SUFFIX:+-$SESSION_SUFFIX}"
     # Dots have special meaning in tmux targets (window.pane), so avoid them.
     tmux_name="${tmux_name//[^A-Za-z0-9_-]/-}"
     if [ ! -t 0 ]; then
-        exec "$CODEX" -s danger-full-access --no-daemon "$@"
+        exec "$CODEX" -s danger-full-access $CODEX_NO_DAEMON "$@"
     fi
     local cmdline
-    printf -v cmdline '%q ' "$CODEX" -s danger-full-access --no-daemon "$@"
+    printf -v cmdline '%q ' "$CODEX" -s danger-full-access $CODEX_NO_DAEMON "$@"
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
         if tmux_env_stale "$tmux_name" CODEX_PROVIDER_API_KEY "$CODEX_PROVIDER_API_KEY"; then
             printf 'codex-provider: %s 的凭证已更新，正在带新凭证重启会话（历史保留）...\n' "$name" >&2
@@ -1089,9 +1100,9 @@ run_legacy_home() {
     tmux_name="codex-legacy-${tag//[^A-Za-z0-9_-]/-}-${sid//[^A-Za-z0-9_-]/-}"
     cd "$home"
     if [ ! -t 0 ]; then
-        exec "$CODEX" -s danger-full-access --no-daemon resume "$sid"
+        exec "$CODEX" -s danger-full-access $CODEX_NO_DAEMON resume "$sid"
     fi
-    printf -v cmdline '%q ' "$CODEX" -s danger-full-access --no-daemon resume "$sid"
+    printf -v cmdline '%q ' "$CODEX" -s danger-full-access $CODEX_NO_DAEMON resume "$sid"
     if tmux has-session -t "$tmux_name" 2>/dev/null; then
         if [ -n "$envkey" ] && tmux_env_stale "$tmux_name" "$envkey" "${!envkey:-}"; then
             printf 'codex-provider: %s 已更新，正在带新凭证重启会话（历史保留）...\n' "$envkey" >&2
